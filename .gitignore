@@ -1,0 +1,12 @@
+# Virtual environment
+.venv/
+
+# Playwright / Patchright browser binaries (large, platform-specific)
+browsers/
+
+# Crawl4AI data directory (cache, screenshots, db)
+.crawl4ai/
+
+# Python cache
+__pycache__/
+*.pyc
