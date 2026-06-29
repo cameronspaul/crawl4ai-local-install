@@ -5,28 +5,33 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectDir = (Resolve-Path $ProjectDir).Path
 
-Write-Host "=== Setting up Crawl4AI in: $ProjectDir ===" -ForegroundColor Cyan
+Write-Host "=== Setting up in: $ProjectDir ===" -ForegroundColor Cyan
 
 # 1. Create virtual environment
-Write-Host "`n[1/5] Creating virtual environment..." -ForegroundColor Yellow
+Write-Host "`n[1/6] Creating virtual environment..." -ForegroundColor Yellow
 python -m venv "$ProjectDir\.venv"
 $python = "$ProjectDir\.venv\Scripts\python.exe"
 $pip = "$ProjectDir\.venv\Scripts\pip.exe"
 
 # 2. Install crawl4ai
-Write-Host "[2/5] Installing crawl4ai..." -ForegroundColor Yellow
+Write-Host "[2/6] Installing crawl4ai..." -ForegroundColor Yellow
 & $pip install -U crawl4ai
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
-# 3. Run setup with local paths
-Write-Host "[3/5] Running crawl4ai-setup (local only)..." -ForegroundColor Yellow
+# 3. Install ddgs
+Write-Host "[3/6] Installing ddgs..." -ForegroundColor Yellow
+& $pip install -U ddgs
+if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+
+# 4. Run setup with local paths
+Write-Host "[4/6] Running crawl4ai-setup (local only)..." -ForegroundColor Yellow
 $env:PLAYWRIGHT_BROWSERS_PATH = "$ProjectDir\browsers"
 $env:CRAWL4_AI_BASE_DIRECTORY = $ProjectDir
 & "$ProjectDir\.venv\Scripts\crawl4ai-setup.exe"
 if ($LASTEXITCODE -ne 0) { throw "crawl4ai-setup failed" }
 
-# 4. Create activation scripts (relative-path, so folder is movable)
-Write-Host "[4/5] Creating activation scripts..." -ForegroundColor Yellow
+# 5. Create activation scripts (relative-path, so folder is movable)
+Write-Host "[5/6] Creating activation scripts..." -ForegroundColor Yellow
 @"
 `$projectDir = Split-Path -Parent `$MyInvocation.MyCommand.Path
 `$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path `$projectDir "browsers"
@@ -42,8 +47,8 @@ set "CRAWL4_AI_BASE_DIRECTORY=%PROJECT_DIR%"
 call "%PROJECT_DIR%.venv\Scripts\activate.bat"
 "@ | Set-Content -Path "$ProjectDir\activate.bat"
 
-# 5. Create .gitignore
-Write-Host "[5/5] Creating .gitignore..." -ForegroundColor Yellow
+# 6. Create .gitignore
+Write-Host "[6/6] Creating .gitignore..." -ForegroundColor Yellow
 @"
 # Virtual environment
 .venv/
