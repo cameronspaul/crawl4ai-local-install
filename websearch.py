@@ -12,7 +12,8 @@ def main():
 
     results = DDGS().text(query, max_results=max_results)
     for r in results:
-        print(f"{r['title']}\n{r['href']}\n{r['body']}\n")
+        line = f"{r['title']}\n{r['href']}\n{r['body']}\n"
+        sys.stdout.buffer.write(line.encode('utf-8'))
 
 
 if __name__ == "__main__":
