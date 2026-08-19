@@ -7,7 +7,7 @@ Minimal CLI tools to scrape web pages to Markdown and search the web using DuckD
 Run the setup script once:
 
 ```powershell
-.\install.ps1
+.\scripts\install.ps1
 ```
 
 ## Quick Usage (No Venv Activation Required!)
@@ -34,10 +34,6 @@ You can run the `.bat` scripts directly from PowerShell or Command Prompt — th
 - **JSON:**
   ```powershell
   .\websearch.bat "fastapi" -n 5 --json
-  ```
-- **Save results to a file:**
-  ```powershell
-  .\websearch.bat "fastapi" -n 10 --markdown -o results.md
   ```
 
 ---

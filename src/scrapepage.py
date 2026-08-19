@@ -13,7 +13,7 @@ if sys.stdout.encoding != "utf-8":
     except Exception:
         pass
 
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.join(PROJECT_DIR, "browsers"))
 os.environ.setdefault("CRAWL4_AI_BASE_DIRECTORY", PROJECT_DIR)
 
@@ -24,14 +24,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   scrapepage https://example.com
-  scrapepage https://example.com -o example.md
 """
     )
     parser.add_argument("url", nargs="?", help="URL of the webpage to scrape")
-    parser.add_argument(
-        "-o", "--output",
-        help="Save markdown output to the specified file path",
-    )
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
@@ -62,7 +57,7 @@ def remove_long_chunks(text: str, max_length: int = 1000) -> str:
     return re.sub(rf"\S{{{max_length},}}", "", text)
 
 
-async def scrape(url: str, output_file: str = None, verbose: bool = False):
+async def scrape(url: str, verbose: bool = False):
     browser_config = BrowserConfig(verbose=verbose)
     run_config = CrawlerRunConfig(verbose=verbose)
 
@@ -77,26 +72,20 @@ async def scrape(url: str, output_file: str = None, verbose: bool = False):
             sys.exit(1)
 
         content = remove_long_chunks(result.markdown or "")
-
-        if output_file:
-            with open(output_file, "w", encoding="utf-8") as f:
-                f.write(content)
-            print(f"Scraped content saved to: {output_file}")
-        else:
-            print(content)
+        print(content)
 
 
 def main():
     args = parse_args()
     if not args.url:
-        print("Error: URL is required.\nUsage: scrapepage <url> [-o output.md]", file=sys.stderr)
+        print("Error: URL is required.\nUsage: scrapepage <url>", file=sys.stderr)
         sys.exit(1)
 
     if not args.url.startswith("http://") and not args.url.startswith("https://"):
         args.url = "https://" + args.url
 
     try:
-        asyncio.run(scrape(args.url, args.output, verbose=args.verbose))
+        asyncio.run(scrape(args.url, verbose=args.verbose))
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.", file=sys.stderr)
         sys.exit(130)
