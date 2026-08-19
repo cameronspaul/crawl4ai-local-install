@@ -1,29 +1,56 @@
-# Webscrape Test
+# Webscrape CLI Tools
 
-Minimal CLI tools to scrape URLs and search the web using [DDGS](https://github.com/deedy5/ddgs).
+Minimal CLI tools to scrape web pages to Markdown and search the web using DuckDuckGo ([DDGS](https://github.com/deedy5/ddgs)) and [Crawl4AI](https://github.com/unclecode/crawl4ai).
 
 ## Setup
+
+Run the setup script once:
 
 ```powershell
 .\install.ps1
 ```
 
-## Usage
+## Quick Usage (No Venv Activation Required!)
 
-Activate the venv first:
+You can run the `.bat` scripts directly from PowerShell or Command Prompt — they automatically use the `.venv` Python environment for you.
 
+### 🔍 Search the Web (`websearch.bat`)
+
+**Basic search:**
 ```powershell
-.venv\Scripts\Activate.ps1
+.\websearch.bat "python asyncio tutorial"
+.\websearch.bat "machine learning" 5
 ```
 
-### Search the web - query amount of results you want
+**Output formats:**
+- **Rich formatted cards (default):**
+  ```powershell
+  .\websearch.bat "fastapi" -n 5
+  ```
+- **Markdown list:**
+  ```powershell
+  .\websearch.bat "fastapi" -n 5 --markdown
+  ```
+- **JSON:**
+  ```powershell
+  .\websearch.bat "fastapi" -n 5 --json
+  ```
+- **Save results to a file:**
+  ```powershell
+  .\websearch.bat "fastapi" -n 10 --markdown -o results.md
+  ```
 
+---
+
+### 🕷️ Scrape a Page (`scrapepage.bat`)
+
+**Scrape page to Markdown in terminal:**
 ```powershell
-python websearch.py "live free or die" 20
+.\scrapepage.bat https://example.com
 ```
 
-### Scrape a page to markdown
-
+**Scrape and save directly to file:**
 ```powershell
-python scrapepage.py https://example.com
+.\scrapepage.bat https://example.com -o page.md
 ```
+
