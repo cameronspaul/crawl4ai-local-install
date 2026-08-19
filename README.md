@@ -14,6 +14,8 @@ Run the setup script once:
 
 You can run the `.bat` scripts directly from PowerShell or Command Prompt — they automatically use the `.venv` Python environment for you.
 
+IMPORTANT NOTE - If the page can't be scraped via this Don't try anything else. Don't try making other Python scripts or curl commands. It just means that the website is not available.
+
 ### 🔍 Search the Web (`websearch.bat`)
 
 **Basic search:**
