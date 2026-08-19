@@ -3,7 +3,7 @@ import asyncio
 import io
 import os
 import sys
-from crawl4ai import AsyncWebCrawler
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
 # Ensure UTF-8 output for Windows console
 if sys.stdout.encoding != "utf-8":
@@ -31,12 +31,43 @@ def parse_args():
         "-o", "--output",
         help="Save markdown output to the specified file path",
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose crawler logs",
+    )
     return parser.parse_args()
 
 
-async def scrape(url: str, output_file: str = None):
-    async with AsyncWebCrawler() as crawler:
-        result = await crawler.arun(url=url)
+def format_error(error_msg: str) -> str:
+    if not error_msg:
+        return "Unknown error occurred during scraping."
+    lines = [line.strip() for line in error_msg.strip().splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith("Page.goto:"):
+            return line
+        if line.startswith("Blocked by"):
+            return line
+    for line in lines:
+        if line.startswith("Error:") and not line.startswith("Error: Failed on navigating"):
+            return line
+    return lines[0] if lines else error_msg
+
+
+async def scrape(url: str, output_file: str = None, verbose: bool = False):
+    browser_config = BrowserConfig(verbose=verbose)
+    run_config = CrawlerRunConfig(verbose=verbose)
+
+    async with AsyncWebCrawler(config=browser_config) as crawler:
+        result = await crawler.arun(url=url, config=run_config)
+
+        if not result.success:
+            err_detail = format_error(result.error_message)
+            print(f"Error: Page doesn't seem to exist. Failed to scrape. Don't attempt again. '{url}': {err_detail}", file=sys.stderr)
+            if verbose and result.error_message:
+                print(f"\nFull error details:\n{result.error_message}", file=sys.stderr)
+            sys.exit(1)
+
         content = result.markdown or ""
 
         if output_file:
@@ -57,7 +88,7 @@ def main():
         args.url = "https://" + args.url
 
     try:
-        asyncio.run(scrape(args.url, args.output))
+        asyncio.run(scrape(args.url, args.output, verbose=args.verbose))
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.", file=sys.stderr)
         sys.exit(130)
