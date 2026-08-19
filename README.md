@@ -23,7 +23,7 @@ You can run the `.bat` scripts directly from PowerShell or Command Prompt — th
 ```
 
 **Output formats:**
-- **Rich formatted cards (default):**
+- **Clean formatted list (default):**
   ```powershell
   .\websearch.bat "fastapi" -n 5
   ```
