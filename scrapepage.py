@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import io
 import os
+import re
 import sys
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
@@ -54,6 +55,13 @@ def format_error(error_msg: str) -> str:
     return lines[0] if lines else error_msg
 
 
+def remove_long_chunks(text: str, max_length: int = 1000) -> str:
+    """Remove any unbroken non-whitespace tokens (e.g. giant base64 data, tracking URLs) exceeding max_length characters."""
+    if not text:
+        return ""
+    return re.sub(rf"\S{{{max_length},}}", "", text)
+
+
 async def scrape(url: str, output_file: str = None, verbose: bool = False):
     browser_config = BrowserConfig(verbose=verbose)
     run_config = CrawlerRunConfig(verbose=verbose)
@@ -68,7 +76,7 @@ async def scrape(url: str, output_file: str = None, verbose: bool = False):
                 print(f"\nFull error details:\n{result.error_message}", file=sys.stderr)
             sys.exit(1)
 
-        content = result.markdown or ""
+        content = remove_long_chunks(result.markdown or "")
 
         if output_file:
             with open(output_file, "w", encoding="utf-8") as f:
