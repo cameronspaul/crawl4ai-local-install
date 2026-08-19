@@ -40,13 +40,8 @@ You can run the `.bat` scripts directly from PowerShell or Command Prompt — th
 
 ### 🕷️ Scrape a Page (`scrapepage.bat`)
 
-**Scrape page to Markdown in terminal:**
+**Scrape page to Markdown:**
 ```powershell
 .\scrapepage.bat https://example.com
-```
-
-**Scrape and save directly to file:**
-```powershell
-.\scrapepage.bat https://example.com -o page.md
 ```
 

@@ -170,10 +170,6 @@ def parse_args():
         help="Shortcut for Markdown output format",
     )
     parser.add_argument(
-        "-o", "--output",
-        help="Save output to a specified file path",
-    )
-    parser.add_argument(
         "-r", "--region",
         default="wt-wt",
         help="Search region (e.g. us-en, uk-en, wt-wt; default: wt-wt)",
@@ -217,35 +213,6 @@ def main():
     except Exception as e:
         print(f"Search failed: {e}", file=sys.stderr)
         sys.exit(1)
-
-    # Handle saving to file if requested
-    if args.output:
-        try:
-            with open(args.output, "w", encoding="utf-8") as f:
-                if args.format == "json":
-                    json.dump(results, f, indent=2, ensure_ascii=False)
-                elif args.format == "markdown":
-                    f.write(f"# Search Results: {args.query}\n\n")
-                    for idx, r in enumerate(results, 1):
-                        f.write(f"### {idx}. [{r['title']}]({r['url']})\n")
-                        if r.get("date"):
-                            f.write(f"- **Date:** {r['date']}\n")
-                        f.write(f"> {r['snippet']}\n\n")
-                else:
-                    for idx, r in enumerate(results, 1):
-                        f.write(f"[{idx}]\nTitle:   {r['title']}\nURL:     {r['url']}\n")
-                        if r.get("site"):
-                            f.write(f"Site:    {r['site']}\n")
-                        if r.get("date"):
-                            f.write(f"Date:    {r['date']}\n")
-                        if r.get("snippet"):
-                            f.write(f"Snippet: {r['snippet']}\n")
-                        f.write("\n")
-            print(f"Results saved to: {args.output}")
-        except Exception as e:
-            print(f"Error saving to {args.output}: {e}", file=sys.stderr)
-            sys.exit(1)
-        return
 
     # Standard console output
     if args.format == "json":
