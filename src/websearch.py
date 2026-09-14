@@ -4,8 +4,30 @@ import json
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 from ddgs import DDGS
+
+# Persistent micro-daemon client
+try:
+    from daemon_client import is_daemon_alive, daemon_search
+except ImportError:
+    try:
+        from src.daemon_client import is_daemon_alive, daemon_search
+    except ImportError:
+        is_daemon_alive = lambda: False
+        daemon_search = lambda *args, **kwargs: None
+
+# Fast local cross-agent cache
+try:
+    from cache import get_cached_search, set_cached_search, make_search_key
+except ImportError:
+    try:
+        from src.cache import get_cached_search, set_cached_search, make_search_key
+    except ImportError:
+        get_cached_search = lambda key, ttl=1800: None
+        set_cached_search = lambda key, results: None
+        make_search_key = lambda *args: ""
 
 # Ensure UTF-8 output for Windows console
 if sys.stdout.encoding != "utf-8":
@@ -50,7 +72,27 @@ def search(
     region: str = None,
     timelimit: str = None,
     backend: str = "fast",
+    no_cache: bool = False,
 ):
+    cache_key = make_search_key(query, search_type, max_results, region, backend)
+    if not no_cache:
+        cached = get_cached_search(cache_key)
+        if cached:
+            return cached
+
+    # Persistent micro-daemon path (warm pooled HTTP client)
+    if not os.environ.get("INSIDE_DAEMON") and is_daemon_alive() and not timelimit:
+        daemon_res = daemon_search(
+            query=query,
+            max_results=max_results,
+            search_type=search_type,
+            region=region,
+            backend=backend,
+            no_cache=no_cache,
+        )
+        if daemon_res is not None:
+            return daemon_res
+
     ddgs = DDGS()
     kwargs = {"max_results": max_results}
     # Only pass region if non-default to prevent unnecessary DDGS region-routing delay
@@ -107,6 +149,9 @@ def search(
             "snippet": clean_body,
         })
 
+    if processed_results and not no_cache:
+        set_cached_search(cache_key, processed_results)
+
     return processed_results
 
 
@@ -158,14 +203,7 @@ def parse_args():
   websearch "fastapi" --json
 """
     )
-    parser.add_argument("query", nargs="?", help="Search query string")
-    parser.add_argument(
-        "max_results_pos",
-        nargs="?",
-        type=int,
-        default=None,
-        help="Maximum results to return (positional)",
-    )
+    parser.add_argument("queries", nargs="*", help="Search query string(s) (supports multiple for parallel batch search)")
     parser.add_argument(
         "-n", "--num",
         dest="max_results",
@@ -211,15 +249,28 @@ def parse_args():
         default="fast",
         help="Search backend: 'fast' (default, optimized web engines), 'auto', or comma-separated engine names",
     )
+    parser.add_argument(
+        "--no-cache", "--fresh",
+        dest="no_cache",
+        action="store_true",
+        help="Bypass local cache and perform live search",
+    )
 
     args = parser.parse_args()
 
-    if not args.query:
+    raw_queries = args.queries
+    if not raw_queries:
         parser.print_help(file=sys.stderr)
         sys.exit(1)
 
-    if args.max_results_pos is not None:
-        args.max_results = args.max_results_pos
+    # Check if the last positional argument is an integer max_results (e.g. websearch "foo bar" 5)
+    if len(raw_queries) > 1 and raw_queries[-1].isdigit() and args.max_results == 10:
+        args.max_results = int(raw_queries[-1])
+        queries = raw_queries[:-1]
+    else:
+        queries = raw_queries
+
+    args.queries = queries
 
     if args.json:
         args.format = "json"
@@ -233,26 +284,69 @@ def main():
     args = parse_args()
     search_type = "news" if args.news else "text"
 
-    try:
-        results = search(
-            query=args.query,
-            max_results=args.max_results,
-            search_type=search_type,
-            region=args.region,
-            timelimit=args.time,
-            backend=args.backend,
-        )
-    except Exception as e:
-        print(f"Search failed: {e}", file=sys.stderr)
-        sys.exit(1)
+    if len(args.queries) == 1:
+        query = args.queries[0]
+        try:
+            results = search(
+                query=query,
+                max_results=args.max_results,
+                search_type=search_type,
+                region=args.region,
+                timelimit=args.time,
+                backend=args.backend,
+                no_cache=args.no_cache,
+            )
+        except Exception as e:
+            print(f"Search failed: {e}", file=sys.stderr)
+            sys.exit(1)
 
-    # Standard console output
+        # Standard console output
+        if args.format == "json":
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+        elif args.format == "markdown":
+            print_markdown_results(results, query)
+        else:
+            print_clean_list(results, query)
+        return
+
+    # Multi-query batch parallel execution (Option D)
+    def run_one(q):
+        try:
+            return q, search(
+                query=q,
+                max_results=args.max_results,
+                search_type=search_type,
+                region=args.region,
+                timelimit=args.time,
+                backend=args.backend,
+                no_cache=args.no_cache,
+            ), None
+        except Exception as err:
+            return q, [], str(err)
+
+    max_workers = min(len(args.queries), 6)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        batch_results = list(executor.map(run_one, args.queries))
+
     if args.format == "json":
-        print(json.dumps(results, indent=2, ensure_ascii=False))
+        out = {q: res for q, res, err in batch_results}
+        print(json.dumps(out, indent=2, ensure_ascii=False))
     elif args.format == "markdown":
-        print_markdown_results(results, args.query)
+        for idx, (q, res, err) in enumerate(batch_results):
+            if idx > 0:
+                print("\n---\n")
+            if err:
+                print(f"# Search Results: {q}\n\n*Failed: {err}*\n")
+            else:
+                print_markdown_results(res, q)
     else:
-        print_clean_list(results, args.query)
+        for idx, (q, res, err) in enumerate(batch_results):
+            if idx > 0:
+                print("\n" + "=" * 80 + "\n")
+            if err:
+                print(f"\nSearch failed for \"{q}\": {err}\n")
+            else:
+                print_clean_list(res, q)
 
 
 if __name__ == "__main__":

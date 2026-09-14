@@ -18,6 +18,26 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.join(PROJECT_DIR, "browsers"))
 os.environ.setdefault("CRAWL4_AI_BASE_DIRECTORY", PROJECT_DIR)
 
+# Fast local cross-agent cache
+try:
+    from cache import get_cached_scrape, set_cached_scrape
+except ImportError:
+    try:
+        from src.cache import get_cached_scrape, set_cached_scrape
+    except ImportError:
+        get_cached_scrape = lambda url, ttl=7200: None
+        set_cached_scrape = lambda url, content: None
+
+# Persistent micro-daemon client
+try:
+    from daemon_client import is_daemon_alive, daemon_scrape
+except ImportError:
+    try:
+        from src.daemon_client import is_daemon_alive, daemon_scrape
+    except ImportError:
+        is_daemon_alive = lambda: False
+        daemon_scrape = lambda *args, **kwargs: None
+
 CHALLENGE_PATTERNS = [
     re.compile(r"cf-browser-verification", re.I),
     re.compile(r"cloudflare ray id", re.I),
@@ -54,6 +74,12 @@ def parse_args():
         type=int,
         default=20,
         help="Request timeout in seconds (default: 20)",
+    )
+    parser.add_argument(
+        "--no-cache", "--fresh",
+        dest="no_cache",
+        action="store_true",
+        help="Bypass local cache and force fresh network scrape",
     )
     return parser.parse_args()
 
@@ -174,24 +200,43 @@ async def browser_scrape(url: str, verbose: bool = False, timeout: int = 20) -> 
         return remove_long_chunks(result.markdown or "")
 
 
-def scrape_single(url: str, force_browser: bool = False, verbose: bool = False, timeout: int = 20) -> str:
+def scrape_single(url: str, force_browser: bool = False, verbose: bool = False, timeout: int = 20, no_cache: bool = False) -> str:
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
 
-    # Tier 1: Fast HTTP Path
+    # Tier 0: Fast Cross-Agent Shared Cache (< 2ms)
+    if not no_cache and not force_browser:
+        cached = get_cached_scrape(url)
+        if cached:
+            if verbose:
+                print(f"[scrapepage] Cache hit for '{url}'", file=sys.stderr)
+            return cached
+
+    # Tier 0.5: Persistent Micro-Daemon (warm connection pool & pre-imported stack)
+    if not os.environ.get("INSIDE_DAEMON") and not force_browser and is_daemon_alive():
+        daemon_res = daemon_scrape(url, force_browser=force_browser, timeout=timeout, no_cache=no_cache)
+        if daemon_res:
+            if verbose:
+                print(f"[scrapepage] Micro-daemon served '{url}'", file=sys.stderr)
+            return daemon_res
+
+    # Tier 1: Fast HTTP Path (Rust primp)
     if not force_browser:
         fast_timeout = min(timeout, 8)
         ok, result = try_fast_scrape(url, timeout=fast_timeout)
         if ok:
             if verbose:
                 print(f"[scrapepage] Fast HTTP tier succeeded for '{url}'", file=sys.stderr)
+            set_cached_scrape(url, result)
             return result
         elif verbose:
             print(f"[scrapepage] Fast HTTP tier bypassed ({result}), escalating to browser for '{url}'...", file=sys.stderr)
 
     # Tier 2: Crawl4AI Browser Path
     try:
-        return asyncio.run(browser_scrape(url, verbose=verbose, timeout=timeout))
+        content = asyncio.run(browser_scrape(url, verbose=verbose, timeout=timeout))
+        set_cached_scrape(url, content)
+        return content
     except RuntimeError:
         raise
     except Exception as e:
@@ -210,7 +255,13 @@ def main():
     # Single URL: output directly without headers for seamless piping and backwards compatibility
     if len(urls) == 1:
         try:
-            content = scrape_single(urls[0], force_browser=args.browser, verbose=args.verbose, timeout=args.timeout)
+            content = scrape_single(
+                urls[0],
+                force_browser=args.browser,
+                verbose=args.verbose,
+                timeout=args.timeout,
+                no_cache=args.no_cache,
+            )
             print(content)
         except KeyboardInterrupt:
             print("\nOperation cancelled by user.", file=sys.stderr)
@@ -226,7 +277,17 @@ def main():
     # Multiple URLs: scrape concurrently in parallel
     def run_scrape(u):
         try:
-            return u, scrape_single(u, force_browser=args.browser, verbose=args.verbose, timeout=args.timeout), None
+            return (
+                u,
+                scrape_single(
+                    u,
+                    force_browser=args.browser,
+                    verbose=args.verbose,
+                    timeout=args.timeout,
+                    no_cache=args.no_cache,
+                ),
+                None,
+            )
         except Exception as err:
             return u, None, str(err)
 

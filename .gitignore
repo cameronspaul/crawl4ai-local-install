@@ -7,6 +7,9 @@ browsers/
 # Crawl4AI data directory (cache, screenshots, db)
 .crawl4ai/
 
+# Local cache
+.cache/
+
 # Python cache
 __pycache__/
 *.pyc

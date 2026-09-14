@@ -9,4 +9,4 @@ if not exist "%PYTHON_EXE%" (
     exit /b 1
 )
 
-"%PYTHON_EXE%" "%ROOT_DIR%src\websearch.py" %*
+"%PYTHON_EXE%" -O -X utf8 "%ROOT_DIR%src\websearch.py" %*
