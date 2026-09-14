@@ -14,6 +14,9 @@ if sys.stdout.encoding != "utf-8":
     except Exception:
         pass
 
+# Fast web search backends (skips Wikipedia/Grokipedia sequential bottleneck in auto mode)
+FAST_TEXT_BACKENDS = "yahoo,yandex,brave,duckduckgo,startpage,mojeek"
+
 # Regex to capture leading dates in search snippets (e.g. "Aug 3, 2026 ·", "2 days ago ·", "2024-05-12 ·")
 DATE_PREFIX_REGEX = re.compile(
     r'^((?:\d{1,2}\s+(?:secs?|seconds?|mins?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago)|'
@@ -40,10 +43,18 @@ def extract_date_and_clean_body(body: str, raw_date: str = None) -> tuple[str, s
     return date, clean_body
 
 
-def search(query: str, max_results: int = 10, search_type: str = "text", region: str = "wt-wt", timelimit: str = None):
+def search(
+    query: str,
+    max_results: int = 10,
+    search_type: str = "text",
+    region: str = None,
+    timelimit: str = None,
+    backend: str = "fast",
+):
     ddgs = DDGS()
     kwargs = {"max_results": max_results}
-    if region:
+    # Only pass region if non-default to prevent unnecessary DDGS region-routing delay
+    if region and region != "wt-wt":
         kwargs["region"] = region
     if timelimit:
         kwargs["timelimit"] = timelimit
@@ -54,7 +65,22 @@ def search(query: str, max_results: int = 10, search_type: str = "text", region:
             if "url" in r and "href" not in r:
                 r["href"] = r["url"]
     else:
-        raw_results = list(ddgs.text(query, **kwargs))
+        # Fast path for text search: prioritize general web engines over Wikipedia/Grokipedia
+        raw_results = []
+        target_backend = FAST_TEXT_BACKENDS if backend == "fast" else backend
+
+        if target_backend:
+            try:
+                raw_results = list(ddgs.text(query, backend=target_backend, **kwargs))
+            except Exception:
+                raw_results = []
+
+        # Automatic fallback to 'auto' if fast backends didn't yield results
+        if not raw_results and (backend == "fast" or not target_backend):
+            try:
+                raw_results = list(ddgs.text(query, backend="auto", **kwargs))
+            except Exception:
+                raw_results = []
 
     # Process results with cleaned dates and metadata
     processed_results = []
@@ -171,7 +197,7 @@ def parse_args():
     )
     parser.add_argument(
         "-r", "--region",
-        default="wt-wt",
+        default=None,
         help="Search region (e.g. us-en, uk-en, wt-wt; default: wt-wt)",
     )
     parser.add_argument(
@@ -179,6 +205,11 @@ def parse_args():
         choices=["d", "w", "m", "y"],
         default=None,
         help="Time filter (d=day, w=week, m=month, y=year)",
+    )
+    parser.add_argument(
+        "-b", "--backend",
+        default="fast",
+        help="Search backend: 'fast' (default, optimized web engines), 'auto', or comma-separated engine names",
     )
 
     args = parser.parse_args()
@@ -209,6 +240,7 @@ def main():
             search_type=search_type,
             region=args.region,
             timelimit=args.time,
+            backend=args.backend,
         )
     except Exception as e:
         print(f"Search failed: {e}", file=sys.stderr)
