@@ -1,4 +1,41 @@
-Deploy 15 parallel subagents using the web search tooling in @README.md (don't use the native websearch) to search live job boards (DO NOT USE THESE AS WEB SCRAPING DOESN'T WORK - Indeed UK, Totaljobs, LinkedIn) and direct employer portals. Sub agents should only return when they have five jobs that fit or if they genuinely don't then it's Okay, return what they have, even if it's zero, that's fine. 
+Deploy 15 parallel subagents using the web search tooling in @README.md (don't use the native websearch) to search live job boards (DO NOT USE THESE AS WEB SCRAPING DOESN'T WORK - Indeed UK, Totaljobs, LinkedIn) and direct employer portals. Sub agents should only return when they have five jobs that fit or if they genuinely don't then it's Okay, return what they have, even if it's zero, that's fine.
+
+### Mandatory JSON Persistence (Subagent Instruction)
+
+To prevent findings from being lost or truncated during subagent context handoff back to the orchestrator:
+
+* **Directory Creation:** Ensure a directory named `jobs/` exists in the current working directory.
+* **Saving Recommended Roles:** Every subagent that identifies any role meeting 100% of the criteria **MUST save an actual `.json` file** inside the `jobs/` directory before returning.
+* **Naming Scheme:** Save as `jobs/agent_{agent_id}_{sanitized_role_title}.json` (or `jobs/agent_{agent_id}_matches.json` containing an array of all validated roles found by that subagent).
+* **Only Recommended Listings:** Do **not** dump rejected or discarded roles into these files. Only write roles that strictly meet the £4,500 net target, location/transit constraints, and shift window.
+* **JSON Schema:** Each saved role must conform to:
+
+```json
+{
+  "job_title": "string",
+  "company_or_agency": "string",
+  "hourly_rate_gbp": 0.00,
+  "location": "string",
+  "nearest_station": "string",
+  "shift_hours": "string",
+  "contract_type": "string",
+  "expected_weekly_hours": 0,
+  "start_date": "YYYY-MM-DD",
+  "end_date": "YYYY-MM-DD",
+  "application_url": "string",
+  "date_posted": "YYYY-MM-DD",
+  "net_earnings_calculation": {
+    "total_weeks": 0,
+    "gross_total_gbp": 0.00,
+    "estimated_tax_ni_deductions_gbp": 0.00,
+    "net_take_home_gbp": 0.00,
+    "exceeds_threshold": true
+  }
+}
+
+```
+
+---
 
 Here's a brief summary about me. Don't take this as gospel for finding exact roles to that. It's just so you have some context.
 
@@ -16,12 +53,10 @@ Find currently active, entry-level roles available through December 27, 2026. Pr
 
 ### Criteria
 
-* **Role Types:** Target entry-level, no-experience roles—such as retail, hospitality, admin, or seasonal work—using broad category terms (e.g., "supermarket assistant") rather than company-specific queries to avoid redundant searches and save compute.
+* **Role Types:** Target entry-level, no-experience roles—such as retail, hospitality, admin, or seasonal work—using broad category terms (e.g., "supermarket assistant") rather than company-specific queries to avoid redundant searches and save compute. NO WAREHOUSE
 * **Pay Floor & Earnings Target (Strict):**
 * Anything above £12.71/hr.
 * **Minimum Net Take-Home Requirement:** ONLY return jobs where the realistic total net take-home pay (after estimated UK income tax and National Insurance deductions) will exceed **£4,500** between the start date and 24–26 December 2026. If the combination of hours and weeks remaining cannot hit £4,500 net, discard the listing.
-
-
 * **Working Hours & Shift Window (Strict):**
 * **No night shifts.**
 * **Earliest shift start:** 07:00 AM (due to earliest inbound train arrival into London).
@@ -34,7 +69,7 @@ Find currently active, entry-level roles available through December 27, 2026. Pr
 
 ### Required Output Format
 
-For each verified, live role found, Check first to see if all the criteria have been met. Otherwise don't you dare show it. Return:
+For each verified, live role found, Check first to see if all the criteria have been met. Otherwise don't you dare show it. In addition to saving the `.json` file to `jobs/`, output:
 
 1. **Job Title & Company / Agency**
 2. **Hourly Pay Rate** (and shift differentials/overtime if applicable)
@@ -42,4 +77,5 @@ For each verified, live role found, Check first to see if all the criteria have 
 4. **Shift Hours & Commute Fit** (explicitly confirm shift pattern fits within the 07:00–22:00 bracket)
 5. **Contract Dates / Expected Weekly Hours**
 6. **Direct Application Link**
-7. **Net Earnings Calculation:** Full breakdown of gross earnings to net take-home pay (factoring in realistic tax/NI deductions across the remaining weeks) explicitly proving the total exceeds £4,500."
+7. **JSON File Path** (confirm the filepath where the structured record was written)
+8. **Net Earnings Calculation:** Full breakdown of gross earnings to net take-home pay (factoring in realistic tax/NI deductions across the remaining weeks) explicitly proving the total exceeds £4,500.

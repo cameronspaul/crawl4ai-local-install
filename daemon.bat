@@ -18,8 +18,8 @@ exit /b 1
 
 :start
 echo [INFO] Starting persistent scraping daemon...
-start "" "%ROOT_DIR%.venv\Scripts\pythonw.exe" -O -X utf8 "%ROOT_DIR%src\daemon.py"
-powershell -NoProfile -Command "Start-Sleep -Milliseconds 800"
+powershell -NoProfile -Command "Start-Process -FilePath '%PYTHON_EXE%' -ArgumentList '-u -X utf8 \"%ROOT_DIR%src\daemon.py\"' -WorkingDirectory '%ROOT_DIR%' -WindowStyle Hidden"
+powershell -NoProfile -Command "Start-Sleep -Seconds 2"
 "%PYTHON_EXE%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/ping', timeout=2); print('[OK] Daemon active on http://127.0.0.1:8765')" 2>nul
 if %errorlevel% neq 0 (
     echo [ERROR] Failed to start daemon.
