@@ -1,4 +1,4 @@
-Deploy 15 parallel subagents using the web search tooling in @README.md (don't use the native websearch) to search live job boards (DO NOT USE THESE AS WEB SCRAPING DOESN'T WORK - Indeed UK, Totaljobs, LinkedIn) and direct employer portals. Sub agents should only return when they have five jobs that fit or if they genuinely don't then it's Okay, return what they have, even if it's zero, that's fine.
+Deploy 15 parallel subagents using the web search tooling in @README.md and @job-search-skill.md (don't use the native websearch) to search live job boards (DO NOT USE THESE AS WEB SCRAPING DOESN'T WORK - Indeed UK, Totaljobs, LinkedIn, Reed) and direct employer portals. Sub agents should only return when they have five jobs that fit or if they genuinely don't then it's Okay, return what they have, even if it's zero, that's fine.
 
 ### Mandatory JSON Persistence (Subagent Instruction)
 
@@ -53,7 +53,7 @@ Find currently active, entry-level roles available through December 27, 2026. Pr
 
 ### Criteria
 
-* **Role Types:** Target entry-level, no-experience roles—such as retail, hospitality, admin, or seasonal work—using broad category terms (e.g., "supermarket assistant") rather than company-specific queries to avoid redundant searches and save compute. NO WAREHOUSE
+* **Role Types:** Target entry-level, no-experience roles—such as retail, hospitality, admin, or seasonal work—using broad category terms (e.g., "supermarket assistant") rather than company-specific queries to avoid redundant searches and save compute. Prioritize roles that have a high turnover rate. I'm really, really desperate for work. Think about jobs that would just hire me because I'm a living, breathing human. 
 * **Pay Floor & Earnings Target (Strict):**
 * Anything above £12.71/hr.
 * **Minimum Net Take-Home Requirement:** ONLY return jobs where the realistic total net take-home pay (after estimated UK income tax and National Insurance deductions) will exceed **£4,500** between the start date and 24–26 December 2026. If the combination of hours and weeks remaining cannot hit £4,500 net, discard the listing.
@@ -62,6 +62,7 @@ Find currently active, entry-level roles available through December 27, 2026. Pr
 * **Earliest shift start:** 07:00 AM (due to earliest inbound train arrival into London).
 * **Latest shift end:** 22:00 (10:00 PM) hard finish (due to return rail transit limits back to South London/Coulsdon).
 * Shifts must fall entirely within the **07:00–22:00 window**. Filter out any roles requiring overnight turns, 06:00 starts, or closes past 22:00.
+* **No delivery jobs.**
 * **Timeline & Start Date:** Start date is flexible: **immediate start up through early October 2026**. Fixed contract end date on or before **December 24–26** (hard stop: departure flight on December 27).
 * **Location & Commute:** Central London (Zones 1–3) or South London (readily accessible via Thameslink/Southern rail lines out of Coulsdon South / East Croydon, e.g., London Bridge, Blackfriars, Victoria, Croydon hubs).
 * **Volume:** Target 30–40 contracted hours per week (or high-volume agency shift platforms).
