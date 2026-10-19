@@ -49,6 +49,12 @@ For each chosen source, scrape it to read the full content:
 
 Run several scrapes (they can be done in parallel). Read the scraped content to extract the specific facts, numbers, quotes, or details the user needs.
 
+Bot-protected pages (Cloudflare, DataDome, PerimeterX) are handled automatically — the scraper falls back to an anti-bot stealth browser on its own. If you know a source is heavily protected and want to skip the faster tiers, force it:
+
+```powershell
+.\scrapepage.bat https://www.example.com --stealth
+```
+
 ### 4. Synthesize
 
 Combine what you found across sources into a clear, sourced answer. Note where sources agree or conflict. Reference which site/URL each claim came from.
@@ -58,7 +64,7 @@ Combine what you found across sources into a clear, sourced answer. Note where s
 - **Always verify with real data.** Don't guess or rely on memory for current facts, prices, versions, or events — search and scrape instead.
 - **Prefer multiple sources** for any factual claim. Cross-check by reading at least 2-3 pages for important facts.
 - **Use time filters for anything time-sensitive** ("latest", "now", "this week", prices, versions).
-- **If a page fails to scrape** (`scrapepage.bat` prints an error), treat it as unavailable and move on to another source. Do NOT try alternative curl/Python workarounds — a failure means the site is not accessible.
+- **If a page fails to scrape** (`scrapepage.bat` prints an error), treat it as unavailable and move on to another source. The scraper already escalates through fast HTTP → Chromium → anti-bot stealth automatically, so a failure means the site is genuinely inaccessible (or needs interactive human verification). Do NOT try alternative curl/Python workarounds.
 - Keep the final answer concise and organized, with the source URL next to each key claim.
 
 ## Example

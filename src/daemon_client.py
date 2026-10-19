@@ -22,12 +22,14 @@ def daemon_scrape(
     force_browser: bool = False,
     timeout: int = 20,
     no_cache: bool = False,
+    force_stealth: bool = False,
     port: int = DAEMON_PORT,
 ) -> Optional[str]:
     """Dispatch scrape request to persistent warm daemon."""
     payload = {
         "url": url,
         "force_browser": force_browser,
+        "force_stealth": force_stealth,
         "timeout": timeout,
         "no_cache": no_cache,
     }
@@ -39,7 +41,11 @@ def daemon_scrape(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout + 2) as resp:
+        # A forced stealth render may have to launch a cold browser first, so it
+        # gets a generous client timeout; the ordinary path keeps the tight one
+        # so a slow daemon falls back to a local scrape quickly.
+        client_timeout = timeout + 180 if force_stealth else timeout + 2
+        with urllib.request.urlopen(req, timeout=client_timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
             if body.get("success"):
                 return body.get("content", "")

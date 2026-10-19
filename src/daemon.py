@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(PROJECT_DIR, "src"))
 import cache
 import primp
 import scrapepage
+import stealth
 import websearch
 
 DEFAULT_HOST = "127.0.0.1"
@@ -28,6 +29,14 @@ PID_FILE = os.path.join(PROJECT_DIR, ".cache", "daemon.pid")
 
 # Global persistent connection pool
 _primp_pool = primp.Client(impersonate="random", follow_redirects=True, timeout=12)
+
+# One warm patched-Firefox stealth browser, reused across requests. The browser
+# itself is launched lazily on the first stealth scrape, so daemon start stays
+# instant for the common fast paths.
+_warm_stealth = stealth.WarmStealth()
+scrapepage.set_stealth_backend(
+    lambda url, timeout: _warm_stealth.fetch(url, scrapepage.fast_html_to_markdown, timeout)
+)
 
 
 class DaemonHandler(http.server.BaseHTTPRequestHandler):
@@ -60,6 +69,7 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/scrape":
             url = payload.get("url", "")
             force_browser = payload.get("force_browser", False)
+            force_stealth = payload.get("force_stealth", False)
             no_cache = payload.get("no_cache", False)
             timeout = payload.get("timeout", 20)
 
@@ -70,15 +80,15 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
             if not url.startswith("http://") and not url.startswith("https://"):
                 url = "https://" + url
 
-            # Check cache first
-            if not no_cache and not force_browser:
+            # Check cache first (never when a specific tier was forced)
+            if not no_cache and not force_browser and not force_stealth:
                 cached = cache.get_cached_scrape(url)
                 if cached:
                     self._send_json({"success": True, "cached": True, "content": cached})
                     return
 
             # Try pooled primp client
-            if not force_browser:
+            if not force_browser and not force_stealth:
                 try:
                     resp = _primp_pool.get(url)
                     if resp.status_code == 200 and resp.text and len(resp.text.strip()) >= 80:
@@ -95,7 +105,13 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
 
             # Fallback to single runner
             try:
-                content = scrapepage.scrape_single(url, force_browser=force_browser, timeout=timeout, no_cache=no_cache)
+                content = scrapepage.scrape_single(
+                    url,
+                    force_browser=force_browser,
+                    force_stealth=force_stealth,
+                    timeout=timeout,
+                    no_cache=no_cache,
+                )
                 self._send_json({"success": True, "cached": False, "source": "fallback", "content": content})
             except Exception as e:
                 self._send_json({"success": False, "error": str(e)}, status=500)
@@ -151,6 +167,10 @@ def run_daemon(host=DEFAULT_HOST, port=DEFAULT_PORT):
         server.serve_forever()
     finally:
         server.server_close()
+        try:
+            _warm_stealth.close()
+        except Exception:
+            pass
         if os.path.exists(PID_FILE):
             try:
                 os.remove(PID_FILE)
