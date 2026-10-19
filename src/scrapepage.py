@@ -1,10 +1,8 @@
 import argparse
-import asyncio
 import io
 import os
 import re
 import sys
-import types
 from concurrent.futures import ThreadPoolExecutor
 
 # Ensure UTF-8 output for Windows console
@@ -15,8 +13,6 @@ if sys.stdout.encoding != "utf-8":
         pass
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.join(PROJECT_DIR, "browsers"))
-os.environ.setdefault("CRAWL4_AI_BASE_DIRECTORY", PROJECT_DIR)
 
 # Fast local cross-agent cache
 try:
@@ -63,11 +59,15 @@ except ImportError:
 
 if stealth_tier is not None:
     looks_like_challenge = stealth_tier.looks_like_challenge
+    looks_like_consent = stealth_tier.looks_like_consent
 else:
     def looks_like_challenge(text: str) -> bool:
         if not text or len(text) > 9000:
             return False
         return any(pat.search(text) for pat in CHALLENGE_PATTERNS)
+
+    def looks_like_consent(text: str) -> bool:
+        return False
 
 
 #: Optional override installed by the daemon so the stealth tier reuses a warm
@@ -101,12 +101,12 @@ def _try_stealth(url: str, verbose: bool, timeout: int) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Scrape a webpage and convert it to clean Markdown with tiered fast-fetch & Crawl4AI fallback.",
+        description="Scrape a webpage and convert it to clean Markdown with tiered fast-fetch & anti-bot stealth fallback.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   scrapepage https://example.com
   scrapepage https://example.com https://docs.python.org/3/
-  scrapepage https://example.com --browser
+  scrapepage https://example.com --stealth
 """
     )
     parser.add_argument("urls", nargs="*", help="URL(s) of the webpage(s) to scrape")
@@ -114,11 +114,6 @@ def parse_args():
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose crawler logs",
-    )
-    parser.add_argument(
-        "-b", "--browser",
-        action="store_true",
-        help="Force full Chromium browser rendering via Crawl4AI (skips HTTP fast path)",
     )
     parser.add_argument(
         "-s", "--stealth",
@@ -162,33 +157,21 @@ def remove_long_chunks(text: str, max_length: int = 1000) -> str:
     return re.sub(rf"\S{{{max_length},}}", "", text)
 
 
-def get_html2text():
-    """Import CustomHTML2Text from Crawl4AI without loading the entire heavy package."""
-    if "crawl4ai" not in sys.modules:
-        dummy = types.ModuleType("crawl4ai")
-        dummy.__path__ = [os.path.join(PROJECT_DIR, ".venv", "Lib", "site-packages", "crawl4ai")]
-        dummy.__file__ = os.path.join(PROJECT_DIR, ".venv", "Lib", "site-packages", "crawl4ai", "__init__.py")
-        sys.modules["crawl4ai"] = dummy
-
-    from crawl4ai.html2text import CustomHTML2Text
-    return CustomHTML2Text
-
-
 def fast_html_to_markdown(html_content: str, base_url: str) -> str:
-    """Clean HTML and convert to Markdown matching Crawl4AI output format."""
-    from lxml import html
-    tree = html.fromstring(html_content)
+    """Strip non-content tags, resolve links, and convert HTML to Markdown."""
+    from lxml import html as lxml_html
+    from markdownify import markdownify
+
+    tree = lxml_html.fromstring(html_content)
     for bad in tree.xpath("//script | //style | //noscript"):
         bad.drop_tree()
-    cleaned = html.tostring(tree, encoding="utf-8").decode("utf-8")
-
-    cls = get_html2text()
-    h = cls(baseurl=base_url)
-    h.body_width = 0
-    h.ignore_links = False
-    h.ignore_images = False
-    h.single_line_break = True
-    return h.handle(cleaned)
+    try:
+        # Rewrite relative href/src against the page URL (what baseurl did before).
+        tree.make_links_absolute(base_url)
+    except Exception:
+        pass
+    cleaned = lxml_html.tostring(tree, encoding="utf-8").decode("utf-8")
+    return markdownify(cleaned, heading_style="ATX", strip=["script", "style", "noscript"], wrap=False)
 
 
 def try_fast_scrape(url: str, timeout: int = 10) -> tuple[bool, str]:
@@ -209,6 +192,10 @@ def try_fast_scrape(url: str, timeout: int = 10) -> tuple[bool, str]:
             if pat.search(text[:3000]):
                 return False, "Bot challenge detected"
 
+        # A consent wall is a JS interstitial the HTTP tier can't clear
+        if looks_like_consent(text):
+            return False, "Consent wall"
+
         md = fast_html_to_markdown(text, url)
         md = remove_long_chunks(md)
         if len(md.strip()) < 40:
@@ -219,68 +206,28 @@ def try_fast_scrape(url: str, timeout: int = 10) -> tuple[bool, str]:
         return False, str(e)
 
 
-async def browser_scrape(url: str, verbose: bool = False, timeout: int = 20) -> str:
-    """Full browser crawl via Crawl4AI with performance-optimized flags."""
-    # Ensure full Crawl4AI package is loaded if dummy module was used
-    if "crawl4ai" in sys.modules and not hasattr(sys.modules["crawl4ai"], "AsyncWebCrawler"):
-        for m in list(sys.modules.keys()):
-            if m == "crawl4ai" or m.startswith("crawl4ai."):
-                del sys.modules[m]
-
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-
-    extra_args = [
-        "--blink-settings=imagesEnabled=false",
-        "--disable-remote-fonts",
-        "--disable-background-networking",
-        "--disable-component-update",
-        "--disable-sync",
-        "--disable-features=Translate,OptimizationHints,MediaRouter",
-    ]
-    browser_config = BrowserConfig(verbose=verbose, extra_args=extra_args, headless=True)
-    run_config = CrawlerRunConfig(
-        verbose=verbose,
-        delay_before_return_html=0,
-        exclude_all_images=True,
-        page_timeout=timeout * 1000,
-        wait_until="domcontentloaded",
-    )
-
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        result = await crawler.arun(url=url, config=run_config)
-
-        if not result.success:
-            err_detail = format_error(result.error_message)
-            raise RuntimeError(f"Error: Page doesn't seem to exist. Failed to scrape. Don't attempt again. '{url}': {err_detail}")
-
-        return remove_long_chunks(result.markdown or "")
-
-
-def scrape_single(url: str, force_browser: bool = False, force_stealth: bool = False, verbose: bool = False, timeout: int = 20, no_cache: bool = False) -> str:
+def scrape_single(url: str, force_stealth: bool = False, verbose: bool = False, timeout: int = 20, no_cache: bool = False) -> str:
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
 
-    forcing = force_browser or force_stealth
-
     # Tier 0: Fast Cross-Agent Shared Cache (< 2ms)
-    if not no_cache and not forcing:
+    if not no_cache and not force_stealth:
         cached = get_cached_scrape(url)
         if cached:
             if verbose:
                 print(f"[scrapepage] Cache hit for '{url}'", file=sys.stderr)
             return cached
 
-    # Tier 0.5: Persistent Micro-Daemon (warm connection pool & pre-imported stack)
-    if not os.environ.get("INSIDE_DAEMON") and not forcing and is_daemon_alive():
-        daemon_res = daemon_scrape(url, force_browser=force_browser, timeout=timeout, no_cache=no_cache)
+    # Tier 0.5: Persistent Micro-Daemon (warm connection pool & warm stealth browser)
+    if not os.environ.get("INSIDE_DAEMON") and is_daemon_alive():
+        daemon_res = daemon_scrape(url, timeout=timeout, no_cache=no_cache, force_stealth=force_stealth)
         if daemon_res:
             if verbose:
                 print(f"[scrapepage] Micro-daemon served '{url}'", file=sys.stderr)
             return daemon_res
 
-    # Tier 1: Fast HTTP Path (Rust primp)
-    fast_challenge = False
-    if not forcing:
+    # Tier 1: Fast HTTP Path (Rust primp: browser TLS impersonation, no JS)
+    if not force_stealth:
         fast_timeout = min(timeout, 8)
         ok, result = try_fast_scrape(url, timeout=fast_timeout)
         if ok:
@@ -288,52 +235,33 @@ def scrape_single(url: str, force_browser: bool = False, force_stealth: bool = F
                 print(f"[scrapepage] Fast HTTP tier succeeded for '{url}'", file=sys.stderr)
             set_cached_scrape(url, result)
             return result
-        fast_challenge = (result == "Bot challenge detected")
         if verbose:
             print(f"[scrapepage] Fast HTTP tier bypassed ({result}) for '{url}'", file=sys.stderr)
 
-    # Tier order. An explicit bot wall from the cheap tier goes straight to the
-    # stealth engine; otherwise try the Chromium crawler first (faster to start)
-    # and keep the stealth engine as the escalation.
-    if force_stealth:
-        tiers = ["stealth"]
-    elif fast_challenge:
-        tiers = ["stealth", "browser"]
-    else:
-        tiers = ["browser", "stealth"]
+    # Tier 2: Anti-bot stealth engine (patched Firefox) — renders JS and clears
+    # anti-bot walls that the HTTP tier cannot. Last and only browser tier.
+    if verbose:
+        print(f"[scrapepage] Escalating to stealth tier for '{url}'", file=sys.stderr)
+    error = None
+    try:
+        content = _try_stealth(url, verbose, timeout)
+    except Exception as e:
+        content = None
+        error = format_error(str(e))
+        if verbose:
+            print(f"[scrapepage] Stealth tier failed for '{url}': {error}", file=sys.stderr)
 
-    last_error = None
-    for tier in tiers:
-        if tier == "browser":
-            try:
-                content = asyncio.run(browser_scrape(url, verbose=verbose, timeout=timeout))
-                if content and len(content.strip()) >= MIN_CONTENT and not looks_like_challenge(content):
-                    set_cached_scrape(url, content)
-                    return content
-                last_error = "the browser tier returned a bot-challenge or empty page"
-                if verbose:
-                    print(f"[scrapepage] Chromium crawler returned no usable content (challenge/empty) for '{url}'", file=sys.stderr)
-            except Exception as e:
-                last_error = format_error(str(e))
-                if verbose:
-                    print(f"[scrapepage] Chromium crawler failed for '{url}': {last_error}", file=sys.stderr)
-        else:
-            try:
-                content = _try_stealth(url, verbose, timeout)
-            except Exception as e:
-                content = None
-                last_error = format_error(str(e))
-                if verbose:
-                    print(f"[scrapepage] Stealth tier failed for '{url}': {last_error}", file=sys.stderr)
-            if content and len(content.strip()) >= MIN_CONTENT:
-                set_cached_scrape(url, content)
-                return content
-            if last_error is None:
-                last_error = "the stealth browser could not render the page"
+    if content and len(content.strip()) >= MIN_CONTENT:
+        set_cached_scrape(url, content)
+        return content
 
-    if force_stealth:
-        raise RuntimeError(f"Error: Page could not be rendered with the stealth browser. '{url}': {last_error}")
-    raise RuntimeError(f"Error: Page doesn't seem to exist. Failed to scrape. Don't attempt again. '{url}': {last_error}")
+    if stealth_tier is None or not stealth_tier.available():
+        raise RuntimeError(
+            "Error: The stealth engine is not installed, so there is no browser fallback. "
+            f"Run '.\\scripts\\install.ps1' (or 'invisible-playwright fetch'). '{url}'"
+        )
+    detail = f": {error}" if error else ""
+    raise RuntimeError(f"Error: Page doesn't seem to exist. Failed to scrape. Don't attempt again. '{url}'{detail}")
 
 
 def main():
@@ -349,7 +277,6 @@ def main():
         try:
             content = scrape_single(
                 urls[0],
-                force_browser=args.browser,
                 force_stealth=args.stealth,
                 verbose=args.verbose,
                 timeout=args.timeout,
@@ -374,7 +301,6 @@ def main():
                 u,
                 scrape_single(
                     u,
-                    force_browser=args.browser,
                     force_stealth=args.stealth,
                     verbose=args.verbose,
                     timeout=args.timeout,

@@ -198,7 +198,7 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   websearch "python asyncio tutorial"
-  websearch "crawl4ai documentation" 5
+  websearch "python web scraping" 5
   websearch "ai technology" --news
   websearch "fastapi" --json
 """

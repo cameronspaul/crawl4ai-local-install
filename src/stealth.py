@@ -4,7 +4,7 @@ This is the last-resort scraper tier. It drives the C++-patched anti-detect
 Firefox from https://github.com/feder-cr/invisible_playwright, whose fingerprint
 is produced inside the engine (no JS shim) and whose pointer motion is humanized,
 so it gets past Cloudflare / DataDome / PerimeterX style walls that the plain
-HTTP tier and the Crawl4AI Chromium tier cannot.
+HTTP tier cannot.
 
 Everything here is optional and lazily imported: importing this module must not
 cost anything on the common fast path. If the package or its engine are missing,
@@ -82,6 +82,21 @@ _LOADING_PATTERNS = [
 
 def _is_loading(text: Optional[str]) -> bool:
     return bool(text) and any(pat.search(text) for pat in _LOADING_PATTERNS)
+
+
+#: Interstitials that gate the real page behind a consent form. The HTTP tier
+#: cannot click them, so recognising one is a reason to escalate to the browser.
+_CONSENT_PATTERNS = [
+    re.compile(r"before you continue", re.I),
+    re.compile(r"consent\.(google|youtube)\.com", re.I),
+    re.compile(r"we use cookies? and data", re.I),
+    re.compile(r"to continue, please (accept|agree)", re.I),
+]
+
+
+def looks_like_consent(text: Optional[str]) -> bool:
+    """True when the page is a consent wall rather than the content."""
+    return bool(text) and any(pat.search(text) for pat in _CONSENT_PATTERNS)
 
 
 def _engine_present() -> bool:

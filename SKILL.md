@@ -64,7 +64,7 @@ Combine what you found across sources into a clear, sourced answer. Note where s
 - **Always verify with real data.** Don't guess or rely on memory for current facts, prices, versions, or events — search and scrape instead.
 - **Prefer multiple sources** for any factual claim. Cross-check by reading at least 2-3 pages for important facts.
 - **Use time filters for anything time-sensitive** ("latest", "now", "this week", prices, versions).
-- **If a page fails to scrape** (`scrapepage.bat` prints an error), treat it as unavailable and move on to another source. The scraper already escalates through fast HTTP → Chromium → anti-bot stealth automatically, so a failure means the site is genuinely inaccessible (or needs interactive human verification). Do NOT try alternative curl/Python workarounds.
+- **If a page fails to scrape** (`scrapepage.bat` prints an error), treat it as unavailable and move on to another source. The scraper already escalates from the fast HTTP tier to the anti-bot stealth browser automatically, so a failure means the site is genuinely inaccessible (or needs interactive human verification). Do NOT try alternative curl/Python workarounds.
 - Keep the final answer concise and organized, with the source URL next to each key claim.
 
 ## Example

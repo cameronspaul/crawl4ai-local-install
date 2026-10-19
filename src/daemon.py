@@ -10,8 +10,6 @@ import time
 from urllib.parse import urlparse
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.join(PROJECT_DIR, "browsers"))
-os.environ.setdefault("CRAWL4_AI_BASE_DIRECTORY", PROJECT_DIR)
 os.environ["INSIDE_DAEMON"] = "1"
 
 sys.path.insert(0, os.path.join(PROJECT_DIR, "src"))
@@ -68,7 +66,6 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/scrape":
             url = payload.get("url", "")
-            force_browser = payload.get("force_browser", False)
             force_stealth = payload.get("force_stealth", False)
             no_cache = payload.get("no_cache", False)
             timeout = payload.get("timeout", 20)
@@ -80,20 +77,20 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
             if not url.startswith("http://") and not url.startswith("https://"):
                 url = "https://" + url
 
-            # Check cache first (never when a specific tier was forced)
-            if not no_cache and not force_browser and not force_stealth:
+            # Check cache first (never when a tier was forced)
+            if not no_cache and not force_stealth:
                 cached = cache.get_cached_scrape(url)
                 if cached:
                     self._send_json({"success": True, "cached": True, "content": cached})
                     return
 
-            # Try pooled primp client
-            if not force_browser and not force_stealth:
+            # Try pooled primp client (fast HTTP tier)
+            if not force_stealth:
                 try:
                     resp = _primp_pool.get(url)
                     if resp.status_code == 200 and resp.text and len(resp.text.strip()) >= 80:
                         is_challenge = any(pat.search(resp.text[:3000]) for pat in scrapepage.CHALLENGE_PATTERNS)
-                        if not is_challenge:
+                        if not is_challenge and not scrapepage.looks_like_consent(resp.text):
                             md = scrapepage.fast_html_to_markdown(resp.text, url)
                             md = scrapepage.remove_long_chunks(md)
                             if len(md.strip()) >= 40:
@@ -103,11 +100,10 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            # Fallback to single runner
+            # Fallback to single runner (fast HTTP -> warm stealth browser)
             try:
                 content = scrapepage.scrape_single(
                     url,
-                    force_browser=force_browser,
                     force_stealth=force_stealth,
                     timeout=timeout,
                     no_cache=no_cache,

@@ -19,7 +19,6 @@ def is_daemon_alive(port: int = DAEMON_PORT, timeout: float = 0.05) -> bool:
 
 def daemon_scrape(
     url: str,
-    force_browser: bool = False,
     timeout: int = 20,
     no_cache: bool = False,
     force_stealth: bool = False,
@@ -28,7 +27,6 @@ def daemon_scrape(
     """Dispatch scrape request to persistent warm daemon."""
     payload = {
         "url": url,
-        "force_browser": force_browser,
         "force_stealth": force_stealth,
         "timeout": timeout,
         "no_cache": no_cache,

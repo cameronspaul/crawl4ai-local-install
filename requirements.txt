@@ -1,3 +1,5 @@
-crawl4ai
 ddgs
 invisible-playwright
+lxml
+markdownify
+primp
