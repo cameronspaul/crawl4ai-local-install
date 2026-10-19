@@ -70,6 +70,20 @@ def looks_like_challenge(text: Optional[str]) -> bool:
     return any(pat.search(text) for pat in CHALLENGE_PATTERNS)
 
 
+#: Client-side apps that have finished their network but not their paint show
+#: one of these while their data request is still in flight.
+_LOADING_PATTERNS = [
+    re.compile(r"loading (results|\.\.\.)", re.I),
+    re.compile(r"fetching (results|\.\.\.)", re.I),
+    re.compile(r"please wait", re.I),
+    re.compile(r"searching\.\.\.", re.I),
+]
+
+
+def _is_loading(text: Optional[str]) -> bool:
+    return bool(text) and any(pat.search(text) for pat in _LOADING_PATTERNS)
+
+
 def _engine_present() -> bool:
     """Cheap check that the patched engine is already unpacked in the cache.
 
@@ -122,15 +136,19 @@ def _read_page(page, url: str, convert, settle_wait: float, min_chars: int = 200
     def read() -> str:
         return _markdown(page.content(), page.url or url, convert)
 
+    start = time.time()
     md = read()
     prev = None
     stable = 0
-    deadline = time.time() + settle_wait
+    deadline = start + settle_wait
     while time.time() < deadline:
-        if not looks_like_challenge(md) and len(md.strip()) >= min_chars:
+        challenge = looks_like_challenge(md)
+        # A shell that says "Loading results" is not content yet, even if long.
+        loading = _is_loading(md) and (time.time() - start) < 6
+        if not challenge and not loading and len(md.strip()) >= min_chars:
             break
         stable = stable + 1 if (md and md == prev) else 0
-        if stable >= 2 and not looks_like_challenge(md):
+        if stable >= 2 and not challenge and not loading:
             break
         prev = md
         try:
@@ -151,6 +169,93 @@ def _open(browser, timeout: float):
     page = browser.new_page()
     page.set_default_navigation_timeout(timeout * 1000)
     return page
+
+
+#: Consent/cookie walls that hide the real content until dismissed. Only
+#: unambiguous labels are listed so an ordinary page never gets a stray click.
+CONSENT_LABELS = (
+    "Reject all",
+    "Decline all",
+    "Deny all",
+    "Reject",
+    "Only necessary",
+    "Accept all",
+    "Allow all",
+    "Accept all cookies",
+    "I agree",
+    "Agree",
+)
+
+
+def _dismiss_consent(page) -> bool:
+    """Click through a cookie/consent interstitial if one is present."""
+    before = page.url
+    for label in CONSENT_LABELS:
+        for exact in (True, False):
+            try:
+                loc = page.get_by_role("button", name=label, exact=exact)
+                if loc.count() > 0:
+                    loc.first.click(timeout=2500)
+                    _settle_after_consent(page, before)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _settle_after_consent(page, before: str) -> None:
+    """Wait for the page behind a consent wall to actually appear.
+
+    A consent *redirect* (e.g. consent.google.com) navigates back to the real
+    site; a plain cookie banner does not. Only the former needs a long wait.
+    """
+    redirecting = "consent" in (before or "").lower() or "consent" in page.url.lower()
+    budget = 8.0 if redirecting else 1.0
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        try:
+            if page.url != before:
+                break
+        except Exception:
+            return
+        try:
+            page.wait_for_timeout(300)
+        except Exception:
+            return
+
+    if page.url != before:
+        _quiet(page, 6000)
+        try:
+            page.wait_for_timeout(2500)  # let the destination SPA paint
+        except Exception:
+            pass
+
+
+def _quiet(page, ms: int) -> None:
+    try:
+        page.wait_for_load_state("networkidle", timeout=ms)
+    except Exception:
+        pass
+
+
+def _render(browser, url, convert, timeout, settle_wait, verbose=False):
+    """Load a URL, clear any consent wall, and return its markdown."""
+    page = _open(browser, timeout)
+    try:
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        if verbose and resp is not None:
+            print(f"[stealth] HTTP {resp.status} for '{url}'", file=sys.stderr)
+        _quiet(page, 4000)
+        if _dismiss_consent(page):
+            if verbose:
+                print(f"[stealth] dismissed a consent interstitial for '{url}'", file=sys.stderr)
+            _quiet(page, 5000)
+        return _read_page(page, url, convert, settle_wait)
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
 
 
 def scrape(
@@ -177,15 +282,7 @@ def scrape(
         timezone="auto",
         locale="auto",
     ) as browser:
-        page = _open(browser, timeout)
-        resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=4000)
-        except Exception:
-            pass
-        if verbose and resp is not None:
-            print(f"[stealth] HTTP {resp.status} for '{url}'", file=sys.stderr)
-        return _read_page(page, url, convert, settle_wait)
+        return _render(browser, url, convert, timeout, settle_wait, verbose)
 
 
 class WarmStealth:
@@ -228,17 +325,7 @@ class WarmStealth:
                         locale="auto",
                     )
                     browser = launcher.__enter__()
-                page = _open(browser, timeout)
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=4000)
-                except Exception:
-                    pass
-                md = _read_page(page, url, convert, self._settle_wait)
-                try:
-                    page.close()
-                except Exception:
-                    pass
+                md = _render(browser, url, convert, timeout, self._settle_wait)
                 fut.set_result(md)
             except Exception as exc:
                 # The browser may be wedged; drop it so the next job relauches.

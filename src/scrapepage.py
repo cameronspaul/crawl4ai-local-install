@@ -47,6 +47,10 @@ CHALLENGE_PATTERNS = [
     re.compile(r"<title>Attention Required! \| Cloudflare</title>", re.I),
 ]
 
+#: A browser-tier result shorter than this is treated as an unrendered shell
+#: rather than real content (matches the threshold the fast HTTP tier uses).
+MIN_CONTENT = 40
+
 # Optional anti-bot stealth tier (invisible_playwright / patched Firefox).
 # Stdlib-only import; the browser package itself is imported lazily on use.
 try:
@@ -303,12 +307,12 @@ def scrape_single(url: str, force_browser: bool = False, force_stealth: bool = F
         if tier == "browser":
             try:
                 content = asyncio.run(browser_scrape(url, verbose=verbose, timeout=timeout))
-                if content and not looks_like_challenge(content):
+                if content and len(content.strip()) >= MIN_CONTENT and not looks_like_challenge(content):
                     set_cached_scrape(url, content)
                     return content
-                last_error = "the browser tier returned a bot-challenge page"
+                last_error = "the browser tier returned a bot-challenge or empty page"
                 if verbose:
-                    print(f"[scrapepage] Chromium crawler got a challenge page for '{url}'", file=sys.stderr)
+                    print(f"[scrapepage] Chromium crawler returned no usable content (challenge/empty) for '{url}'", file=sys.stderr)
             except Exception as e:
                 last_error = format_error(str(e))
                 if verbose:
@@ -321,7 +325,7 @@ def scrape_single(url: str, force_browser: bool = False, force_stealth: bool = F
                 last_error = format_error(str(e))
                 if verbose:
                     print(f"[scrapepage] Stealth tier failed for '{url}': {last_error}", file=sys.stderr)
-            if content:
+            if content and len(content.strip()) >= MIN_CONTENT:
                 set_cached_scrape(url, content)
                 return content
             if last_error is None:
