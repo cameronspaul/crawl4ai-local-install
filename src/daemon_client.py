@@ -22,15 +22,29 @@ def daemon_scrape(
     timeout: int = 20,
     no_cache: bool = False,
     force_stealth: bool = False,
+    raw: bool = False,
+    ready_markers: tuple[str, ...] | list[str] | None = None,
+    settle_wait: float | None = None,
+    verbose: bool = False,
     port: int = DAEMON_PORT,
 ) -> Optional[str]:
-    """Dispatch scrape request to persistent warm daemon."""
+    """Dispatch scrape request to persistent warm daemon.
+
+    Set ``raw=True`` to ask for the original HTML instead of Markdown and
+    ``ready_markers`` to wait for a specific client-rendered block.
+    """
     payload = {
         "url": url,
         "force_stealth": force_stealth,
         "timeout": timeout,
         "no_cache": no_cache,
+        "raw": raw,
+        "verbose": verbose,
     }
+    if ready_markers:
+        payload["ready_markers"] = list(ready_markers)
+    if settle_wait is not None:
+        payload["settle_wait"] = settle_wait
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"http://{DAEMON_HOST}:{port}/scrape",
@@ -42,7 +56,7 @@ def daemon_scrape(
         # A forced stealth render may have to launch a cold browser first, so it
         # gets a generous client timeout; the ordinary path keeps the tight one
         # so a slow daemon falls back to a local scrape quickly.
-        client_timeout = timeout + 180 if force_stealth else timeout + 2
+        client_timeout = timeout + 180 if (force_stealth or raw) else timeout + 2
         with urllib.request.urlopen(req, timeout=client_timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
             if body.get("success"):

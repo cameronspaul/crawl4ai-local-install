@@ -17,6 +17,12 @@ echo Usage: daemon.bat {start^|stop^|status^|restart}
 exit /b 1
 
 :start
+"%PYTHON_EXE%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/ping', timeout=1)" >nul 2>nul
+if %errorlevel% equ 0 (
+    echo [OK] Daemon already running on http://127.0.0.1:8765
+    echo [INFO] Use 'daemon.bat restart' to reload code changes.
+    exit /b 0
+)
 echo [INFO] Starting persistent scraping daemon...
 powershell -NoProfile -Command "Start-Process -FilePath '%PYTHON_EXE%' -ArgumentList '-u -X utf8 \"%ROOT_DIR%src\daemon.py\"' -WorkingDirectory '%ROOT_DIR%' -WindowStyle Hidden"
 powershell -NoProfile -Command "Start-Sleep -Seconds 2"
@@ -29,12 +35,9 @@ exit /b 0
 
 :stop
 echo [INFO] Stopping persistent scraping daemon...
-"%PYTHON_EXE%" -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8765/shutdown', data=b'{}', headers={'Content-Type': 'application/json'}))" 2>nul
-if %errorlevel% equ 0 (
-    echo [OK] Daemon stopped successfully.
-) else (
-    echo [INFO] Daemon was not running.
-)
+"%PYTHON_EXE%" -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8765/shutdown', data=b'{}', headers={'Content-Type': 'application/json'}), timeout=3)" >nul 2>nul
+powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; for ($i=0; $i -lt 20; $i++) { try { $c = New-Object Net.Sockets.TcpClient; $c.Connect('127.0.0.1', 8765); $c.Close(); Start-Sleep -Milliseconds 250 } catch { break } }; Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*src\daemon.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+echo [OK] Daemon stopped successfully.
 exit /b 0
 
 :status

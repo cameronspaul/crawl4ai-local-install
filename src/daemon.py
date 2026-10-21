@@ -69,6 +69,13 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
             force_stealth = payload.get("force_stealth", False)
             no_cache = payload.get("no_cache", False)
             timeout = payload.get("timeout", 20)
+            raw = payload.get("raw", False)
+            verbose = bool(payload.get("verbose", False))
+            ready_markers = payload.get("ready_markers") or None
+            if isinstance(ready_markers, list):
+                ready_markers = tuple(str(m) for m in ready_markers)
+            settle_wait = payload.get("settle_wait")
+            settle_wait = float(settle_wait) if settle_wait is not None else None
 
             if not url:
                 self._send_json({"error": "URL required"}, status=400)
@@ -77,8 +84,22 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
             if not url.startswith("http://") and not url.startswith("https://"):
                 url = "https://" + url
 
-            # Check cache first (never when a tier was forced)
-            if not no_cache and not force_stealth:
+            def markers_present(content: str) -> bool:
+                # Match the browser tier's readiness rule (any marker means the
+                # client-rendered block is present).
+                return not ready_markers or any(
+                    marker in content for marker in ready_markers
+                )
+
+            # Raw HTML is cached under its own key (never mixed with Markdown).
+            if raw and not no_cache:
+                cached_html = cache.get_cached_html(url)
+                if cached_html:
+                    self._send_json({"success": True, "cached": True, "content": cached_html})
+                    return
+
+            # Raw HTML is never served from the Markdown cache.
+            if not raw and not no_cache and not force_stealth:
                 cached = cache.get_cached_scrape(url)
                 if cached:
                     self._send_json({"success": True, "cached": True, "content": cached})
@@ -91,6 +112,11 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
                     if resp.status_code == 200 and resp.text and len(resp.text.strip()) >= 80:
                         is_challenge = any(pat.search(resp.text[:3000]) for pat in scrapepage.CHALLENGE_PATTERNS)
                         if not is_challenge and not scrapepage.looks_like_consent(resp.text):
+                            if raw:
+                                if markers_present(resp.text):
+                                    cache.set_cached_html(url, resp.text)
+                                self._send_json({"success": True, "cached": False, "source": "primp_pool", "content": resp.text})
+                                return
                             md = scrapepage.fast_html_to_markdown(resp.text, url)
                             md = scrapepage.remove_long_chunks(md)
                             if len(md.strip()) >= 40:
@@ -99,6 +125,27 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
                                 return
                 except Exception:
                     pass
+
+            # Raw HTML fallback: warm stealth browser, no Markdown conversion.
+            if raw:
+                try:
+                    html = _warm_stealth.fetch(
+                        url,
+                        None,
+                        timeout,
+                        ready_markers=ready_markers,
+                        settle_wait=settle_wait,
+                        verbose=verbose,
+                    )
+                    if html and len(html.strip()) >= 200:
+                        if markers_present(html):
+                            cache.set_cached_html(url, html)
+                        self._send_json({"success": True, "cached": False, "source": "stealth_raw", "content": html})
+                    else:
+                        self._send_json({"success": False, "error": "Empty HTML from stealth browser"}, status=500)
+                except Exception as e:
+                    self._send_json({"success": False, "error": str(e)}, status=500)
+                return
 
             # Fallback to single runner (fast HTTP -> warm stealth browser)
             try:

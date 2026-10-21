@@ -107,6 +107,8 @@ def parse_args():
   scrapepage https://example.com
   scrapepage https://example.com https://docs.python.org/3/
   scrapepage https://example.com --stealth
+  scrapepage https://example.com --html
+  scrapepage https://example.com --no-cache
 """
     )
     parser.add_argument("urls", nargs="*", help="URL(s) of the webpage(s) to scrape")
@@ -131,6 +133,11 @@ def parse_args():
         dest="no_cache",
         action="store_true",
         help="Bypass local cache and force fresh network scrape",
+    )
+    parser.add_argument(
+        "--html",
+        action="store_true",
+        help="Print raw rendered HTML instead of Markdown (useful for structured extraction)",
     )
     return parser.parse_args()
 
@@ -174,8 +181,13 @@ def fast_html_to_markdown(html_content: str, base_url: str) -> str:
     return markdownify(cleaned, heading_style="ATX", strip=["script", "style", "noscript"], wrap=False)
 
 
-def try_fast_scrape(url: str, timeout: int = 10) -> tuple[bool, str]:
-    """Attempt ultra-fast HTTP scrape using primp (Rust HTTP client with browser TLS impersonation)."""
+def try_fast_html(url: str, timeout: int = 10, min_chars: int = 200) -> tuple[bool, str]:
+    """Fetch raw HTML with primp (Rust HTTP client, browser TLS impersonation).
+
+    Returns ``(True, html)`` only for a real 200 response that does not look
+    like a bot challenge or consent wall. A 202 is specifically rejected:
+    some sites return it for an anti-bot shell rather than real content.
+    """
     try:
         import primp
         client = primp.Client(impersonate="random", follow_redirects=True, timeout=timeout)
@@ -184,18 +196,28 @@ def try_fast_scrape(url: str, timeout: int = 10) -> tuple[bool, str]:
             return False, f"HTTP {resp.status_code}"
 
         text = resp.text
-        if not text or len(text.strip()) < 80:
+        if not text or len(text.strip()) < min_chars:
             return False, "Response body too short"
 
-        # Detect bot challenge or JS wall
         for pat in CHALLENGE_PATTERNS:
             if pat.search(text[:3000]):
                 return False, "Bot challenge detected"
 
-        # A consent wall is a JS interstitial the HTTP tier can't clear
         if looks_like_consent(text):
             return False, "Consent wall"
 
+        return True, text
+    except Exception as e:
+        return False, str(e)
+
+
+def try_fast_scrape(url: str, timeout: int = 10) -> tuple[bool, str]:
+    """Attempt ultra-fast HTTP scrape using primp (Rust HTTP client with browser TLS impersonation)."""
+    ok, text = try_fast_html(url, timeout=timeout, min_chars=80)
+    if not ok:
+        return False, text
+
+    try:
         md = fast_html_to_markdown(text, url)
         md = remove_long_chunks(md)
         if len(md.strip()) < 40:
@@ -204,6 +226,98 @@ def try_fast_scrape(url: str, timeout: int = 10) -> tuple[bool, str]:
         return True, md
     except Exception as e:
         return False, str(e)
+
+
+def scrape_html(
+    url: str,
+    force_stealth: bool = False,
+    verbose: bool = False,
+    timeout: int = 30,
+    no_cache: bool = False,
+    ready_markers: tuple[str, ...] | None = None,
+    settle_wait: float = 10.0,
+) -> str:
+    """Return raw HTML, escalating to the stealth browser when needed.
+
+    This is the structured-extraction sibling of :func:`scrape_single`. It is
+    deliberately not stored in the markdown cache, because HTML and Markdown
+    share a cache key. The warm daemon may still serve it when it was started
+    from this version of the code.
+
+    ``ready_markers`` are strings that must appear in the rendered content
+    before it is accepted, so a client-rendered app shell is not mistaken for a
+    finished page.
+    """
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
+    # Warm daemon: pooled primp client + reused stealth browser.
+    daemon_warm = False
+    if not os.environ.get("INSIDE_DAEMON") and is_daemon_alive():
+        daemon_warm = True
+        daemon_res = daemon_scrape(
+            url,
+            timeout=timeout,
+            no_cache=no_cache,
+            force_stealth=force_stealth,
+            raw=True,
+            ready_markers=ready_markers,
+            settle_wait=settle_wait,
+            verbose=verbose,
+        )
+        # Older daemons ignore the raw flag and return Markdown; only accept a
+        # response that actually looks like HTML.
+        if daemon_res and daemon_res.lstrip()[:1] == "<":
+            if verbose:
+                print(f"[scrapepage] Micro-daemon served raw HTML for '{url}'", file=sys.stderr)
+            return daemon_res
+
+    if not force_stealth:
+        ok, result = try_fast_html(url, timeout=min(timeout, 12))
+        if ok:
+            if verbose:
+                print(f"[scrapepage] Fast HTTP tier returned HTML for '{url}'", file=sys.stderr)
+            return result
+        if verbose:
+            print(f"[scrapepage] Fast HTTP tier bypassed ({result}) for '{url}'", file=sys.stderr)
+
+    # A live daemon already owns the warm browser. Launching a second cold
+    # browser here would double the wait and usually fail the same way, so
+    # report the failure instead.
+    if daemon_warm:
+        raise RuntimeError(
+            f"Error: the warm daemon could not render '{url}'. "
+            "Try 'daemon.bat stop && daemon.bat start' and run the command again."
+        )
+
+    if verbose:
+        print(f"[scrapepage] Escalating to stealth tier for raw HTML '{url}'", file=sys.stderr)
+
+    if stealth_tier is None or not stealth_tier.available():
+        raise RuntimeError(
+            "Error: The stealth engine is not installed, so this page cannot be "
+            f"rendered. Run '.\\scripts\\install.ps1'. '{url}'"
+        )
+
+    if _stealth_backend is not None:
+        # Daemon backend converts to Markdown, so it cannot serve raw HTML.
+        content = None
+    else:
+        content = stealth_tier.scrape(
+            url,
+            None,
+            timeout=max(timeout, 30),
+            settle_wait=settle_wait,
+            verbose=verbose,
+            ready_markers=ready_markers,
+        )
+
+    if content and len(content.strip()) >= 200:
+        return content
+
+    raise RuntimeError(
+        f"Error: Could not fetch HTML from '{url}'. The page may need interactive verification."
+    )
 
 
 def scrape_single(url: str, force_stealth: bool = False, verbose: bool = False, timeout: int = 20, no_cache: bool = False) -> str:
@@ -272,16 +386,45 @@ def main():
 
     urls = args.urls
 
-    # Single URL: output directly without headers for seamless piping and backwards compatibility
-    if len(urls) == 1:
-        try:
-            content = scrape_single(
-                urls[0],
+    # cmd.exe splits an unquoted URL query on '&' before Python sees it, so a
+    # pasted dated URL can arrive as "…?from=…", "to=…", "guests=1". Re-join
+    # those fragments instead of treating them as separate pages.
+    joined: list[str] = []
+    for arg in urls:
+        looks_like_url = bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", arg))
+        if (
+            joined
+            and not looks_like_url
+            and not os.path.exists(arg)
+            and "=" in arg
+            and "?" in joined[-1]
+        ):
+            joined[-1] = joined[-1] + "&" + arg
+        else:
+            joined.append(arg)
+    urls = joined
+
+    def fetch(u: str) -> str:
+        if args.html:
+            return scrape_html(
+                u,
                 force_stealth=args.stealth,
                 verbose=args.verbose,
                 timeout=args.timeout,
                 no_cache=args.no_cache,
             )
+        return scrape_single(
+            u,
+            force_stealth=args.stealth,
+            verbose=args.verbose,
+            timeout=args.timeout,
+            no_cache=args.no_cache,
+        )
+
+    # Single URL: output directly without headers for seamless piping and backwards compatibility
+    if len(urls) == 1:
+        try:
+            content = fetch(urls[0])
             print(content)
         except KeyboardInterrupt:
             print("\nOperation cancelled by user.", file=sys.stderr)
@@ -297,17 +440,7 @@ def main():
     # Multiple URLs: scrape concurrently in parallel
     def run_scrape(u):
         try:
-            return (
-                u,
-                scrape_single(
-                    u,
-                    force_stealth=args.stealth,
-                    verbose=args.verbose,
-                    timeout=args.timeout,
-                    no_cache=args.no_cache,
-                ),
-                None,
-            )
+            return (u, fetch(u), None)
         except Exception as err:
             return u, None, str(err)
 

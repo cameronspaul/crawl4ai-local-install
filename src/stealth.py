@@ -140,34 +140,63 @@ def _markdown(html: str, url: str, convert: Optional[Callable[[str, str], str]])
     return convert(html, url)
 
 
-def _read_page(page, url: str, convert, settle_wait: float, min_chars: int = 200) -> Optional[str]:
+def _read_page(
+    page,
+    url: str,
+    convert,
+    settle_wait: float,
+    min_chars: int = 200,
+    ready_markers: tuple[str, ...] | None = None,
+    verbose: bool = False,
+) -> Optional[str]:
     """Pull markdown off a page once it is actually rendered.
 
     Re-reads while the page still looks like a challenge wall (which may solve
     itself) or still looks unrendered (a client-side app that finished its
     network but not its paint). A short page whose content has stopped changing
     is accepted early, so genuinely tiny pages don't pay the full window.
+
+    ``ready_markers`` lets a caller wait for a specific client-rendered block
+    (e.g. a results table) instead of accepting the long app shell that loads
+    before it. When markers are supplied, the shell is never mistaken for
+    finished content.
     """
     def read() -> str:
         return _markdown(page.content(), page.url or url, convert)
+
+    def is_ready(text: str) -> bool:
+        return not ready_markers or any(marker in text for marker in ready_markers)
 
     start = time.time()
     md = read()
     prev = None
     stable = 0
     deadline = start + settle_wait
+    saw_ready = False
     while time.time() < deadline:
         challenge = looks_like_challenge(md)
         # A shell that says "Loading results" is not content yet, even if long.
-        loading = _is_loading(md) and (time.time() - start) < 6
-        if not challenge and not loading and len(md.strip()) >= min_chars:
+        # A specific readiness marker overrides that generic text: raw HTML
+        # includes <script> strings such as "loading...", which are not a
+        # reason to keep waiting once the real panel is in the DOM.
+        ready = is_ready(md)
+        loading = _is_loading(md) and not ready and (time.time() - start) < 6
+        if ready and not saw_ready:
+            saw_ready = True
+            if verbose:
+                print(
+                    f"[stealth] readiness markers appeared after "
+                    f"{time.time() - start:.1f}s for '{url}'",
+                    file=sys.stderr,
+                )
+        if not challenge and not loading and ready and len(md.strip()) >= min_chars:
             break
         stable = stable + 1 if (md and md == prev) else 0
-        if stable >= 2 and not challenge and not loading:
+        if stable >= 2 and not challenge and not loading and ready:
             break
         prev = md
         try:
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(500)
         except Exception:
             break
         try:
@@ -253,19 +282,57 @@ def _quiet(page, ms: int) -> None:
         pass
 
 
-def _render(browser, url, convert, timeout, settle_wait, verbose=False):
+def _render(browser, url, convert, timeout, settle_wait, verbose=False, ready_markers=None):
     """Load a URL, clear any consent wall, and return its markdown."""
     page = _open(browser, timeout)
     try:
+        nav_start = time.time()
         resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
         if verbose and resp is not None:
             print(f"[stealth] HTTP {resp.status} for '{url}'", file=sys.stderr)
-        _quiet(page, 4000)
-        if _dismiss_consent(page):
+        # With a readiness marker the poll in _read_page does the waiting, so a
+        # page that never reaches networkidle does not add a fixed delay.
+        _quiet(page, 1000 if ready_markers else 4000)
+        if verbose:
+            print(
+                f"[stealth] DOM loaded in {time.time() - nav_start:.1f}s for '{url}'",
+                file=sys.stderr,
+            )
+        # Availability tables often sit below the fold and some sites only
+        # request them once they scroll into view. Nudge the page once when the
+        # marker is still missing; this can save seconds on lazy-loaded SPAs.
+        if ready_markers:
+            try:
+                content_now = page.content()
+                if not any(marker in content_now for marker in ready_markers):
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                pass
+        # A marker-driven scrape only needs a consent click when the content is
+        # actually gated (a consent redirect or an interstitial body). Clicking
+        # an ordinary cookie banner can reload the SPA and cost several seconds
+        # for no benefit: the DOM is readable behind the overlay anyway.
+        needs_consent = True
+        if ready_markers:
+            try:
+                needs_consent = (
+                    "consent" in page.url.lower()
+                    or looks_like_consent(page.content())
+                )
+            except Exception:
+                needs_consent = True
+        if needs_consent and _dismiss_consent(page):
             if verbose:
                 print(f"[stealth] dismissed a consent interstitial for '{url}'", file=sys.stderr)
-            _quiet(page, 5000)
-        return _read_page(page, url, convert, settle_wait)
+            _quiet(page, 1500 if ready_markers else 5000)
+        return _read_page(
+            page,
+            url,
+            convert,
+            settle_wait,
+            ready_markers=tuple(ready_markers) if ready_markers else None,
+            verbose=verbose,
+        )
     finally:
         try:
             page.close()
@@ -279,6 +346,7 @@ def scrape(
     timeout: int = 30,
     settle_wait: float = 8.0,
     verbose: bool = False,
+    ready_markers: tuple[str, ...] | None = None,
 ) -> Optional[str]:
     """One-shot stealth scrape: launch, render, tear down.
 
@@ -297,7 +365,15 @@ def scrape(
         timezone="auto",
         locale="auto",
     ) as browser:
-        return _render(browser, url, convert, timeout, settle_wait, verbose)
+        return _render(
+            browser,
+            url,
+            convert,
+            timeout,
+            settle_wait,
+            verbose,
+            ready_markers=ready_markers,
+        )
 
 
 class WarmStealth:
@@ -329,7 +405,7 @@ class WarmStealth:
             job = self._jobs.get()
             if job is None:
                 break
-            url, convert, timeout, fut = job
+            url, convert, timeout, ready_markers, settle_wait, verbose, fut = job
             try:
                 if browser is None:
                     launcher = InvisiblePlaywright(
@@ -340,7 +416,15 @@ class WarmStealth:
                         locale="auto",
                     )
                     browser = launcher.__enter__()
-                md = _render(browser, url, convert, timeout, self._settle_wait)
+                md = _render(
+                    browser,
+                    url,
+                    convert,
+                    timeout,
+                    settle_wait or self._settle_wait,
+                    verbose=verbose,
+                    ready_markers=ready_markers,
+                )
                 fut.set_result(md)
             except Exception as exc:
                 # The browser may be wedged; drop it so the next job relauches.
@@ -364,13 +448,26 @@ class WarmStealth:
         url: str,
         convert: Optional[Callable[[str, str], str]] = None,
         timeout: int = 30,
+        ready_markers: tuple[str, ...] | None = None,
+        settle_wait: float | None = None,
+        verbose: bool = False,
     ) -> Optional[str]:
         """Render `url` on the warm browser. Raises on a hard browser failure."""
         if self._closed:
             raise RuntimeError("stealth session is closed")
         self._ensure_thread()
         fut: Future = Future()
-        self._jobs.put((url, convert, timeout, fut))
+        self._jobs.put(
+            (
+                url,
+                convert,
+                timeout,
+                tuple(ready_markers) if ready_markers else None,
+                settle_wait,
+                verbose,
+                fut,
+            )
+        )
         # The worker applies its own navigation timeout; allow generous slack
         # for a cold browser launch on top of it.
         return fut.result(timeout=timeout + 120)

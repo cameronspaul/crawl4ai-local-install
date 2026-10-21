@@ -71,6 +71,22 @@ def set_cached_scrape(url: str, content: str) -> None:
         pass
 
 
+def get_cached_html(url: str, ttl: float = 900) -> Optional[str]:
+    """Retrieve cached raw HTML for a URL if younger than ttl seconds.
+
+    Raw HTML and Markdown share the same cache table, so HTML uses a prefixed
+    key. This keeps a property-page render reusable without letting the
+    Markdown cache hand an HTML shell back to ``scrape_single``. The default
+    TTL is deliberately short (15 minutes) because these pages carry prices.
+    """
+    return get_cached_scrape("html:" + url, ttl=ttl)
+
+
+def set_cached_html(url: str, content: str) -> None:
+    """Store rendered raw HTML in the local cache."""
+    set_cached_scrape("html:" + url, content)
+
+
 def make_search_key(query: str, search_type: str, max_results: int, region: str = None, backend: str = "fast") -> str:
     raw = f"{query.strip().lower()}|{search_type}|{max_results}|{region or ''}|{backend}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
