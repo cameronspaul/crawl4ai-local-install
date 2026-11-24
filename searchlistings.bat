@@ -1,0 +1,12 @@
+@echo off
+setlocal
+set "ROOT_DIR=%~dp0"
+set "PYTHON_EXE=%ROOT_DIR%.venv\Scripts\python.exe"
+
+if not exist "%PYTHON_EXE%" (
+    echo [ERROR] Virtual environment not found at "%ROOT_DIR%.venv".
+    echo Please run .\scripts\install.ps1 first.
+    exit /b 1
+)
+
+"%PYTHON_EXE%" -O -X utf8 "%ROOT_DIR%src\searchlistings.py" %*

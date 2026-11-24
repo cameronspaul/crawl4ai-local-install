@@ -11,3 +11,6 @@ __pycache__/
 jobs/
 node_modules
 demos
+
+# Large one-off HTML captures used while writing parsers (small fixtures are kept in tests/fixtures/)
+research/

@@ -89,6 +89,32 @@ The stealth tier is a real browser, so a cold render costs ~10 s. With the daemo
 
 `ready_markers` lets an integration wait for a specific client-rendered block (for example a results panel) instead of accepting a long app shell, and skips the fixed network-idle delay. The warm daemon accepts the same options over HTTP.
 
+### 🛒 Search PC parts across retailers (`searchlistings.bat`)
+
+Turns a search query into a clean list of product listings (title, price, link,
+stock/delivery note) from Scan, Overclockers, Ebuyer, Amazon UK, WeBuy, GPUsed
+and CCL. It reuses the same cache / fast-HTTP / stealth tiers as `scrapepage`.
+
+```powershell
+.\searchlistings.bat "power supply"                     # all retailers
+.\searchlistings.bat "rtx 3060" -s scan -s ccl -n 10    # chosen retailers
+.\searchlistings.bat "motherboard am4" --format md      # Markdown table
+.\searchlistings.bat "ram ddr4" --format json > out.json
+.\searchlistings.bat --url "https://www.scan.co.uk/search?q=power+supply"
+```
+
+Options: `-s/--site NAME` (repeatable; names or domains), `--url URL`
+(repeatable, use the exact search URL instead of a query), `-f/--format
+text|md|json|csv`, `-n/--limit N` (default 20 per retailer), `--no-cache`,
+`--timeout`, `-v/--verbose`. Listings without a real price (e.g. "POA" or
+Scan's `999999.00` placeholder) or marked sold out / out of stock / unavailable
+are filtered out across all retailers, so results are things you can actually
+buy.
+
+Each retailer has its own parser in `src/listings/`, with the shared contract
+documented in `src/listings/base.py`. If a retailer changes its markup, only
+its parser module needs updating.
+
 ### Other platforms
 
 The `.bat` wrappers are Windows-only. On macOS/Linux run the Python scripts directly with the venv interpreter, e.g. `python src/scrapepage.py <url>` and `python src/websearch.py <query>`.
