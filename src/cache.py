@@ -9,6 +9,15 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.path.join(PROJECT_DIR, ".cache")
 DB_PATH = os.path.join(CACHE_DIR, "fast_cache.db")
 
+#: Bump whenever the shape of cached Markdown changes so old-format entries
+#: are never served to a client expecting the new layout.
+MARKDOWN_CACHE_VERSION = 2
+
+
+def make_markdown_cache_key(url: str) -> str:
+    """Namespace a URL's Markdown cache entry by output format version."""
+    return f"mdv{MARKDOWN_CACHE_VERSION}:{url}"
+
 
 def _get_db():
     os.makedirs(CACHE_DIR, exist_ok=True)

@@ -32,9 +32,18 @@ _primp_pool = primp.Client(impersonate="random", follow_redirects=True, timeout=
 # itself is launched lazily on the first stealth scrape, so daemon start stays
 # instant for the common fast paths.
 _warm_stealth = stealth.WarmStealth()
-scrapepage.set_stealth_backend(
-    lambda url, timeout: _warm_stealth.fetch(url, scrapepage.fast_html_to_markdown, timeout)
-)
+
+
+def _warm_markdown(url, timeout, readable=True):
+    """Render on the warm browser, honouring the caller's Markdown layout."""
+    return _warm_stealth.fetch(
+        url,
+        lambda html, base: scrapepage.fast_html_to_markdown(html, base, readable=readable),
+        timeout,
+    )
+
+
+scrapepage.set_stealth_backend(_warm_markdown)
 
 
 class DaemonHandler(http.server.BaseHTTPRequestHandler):
@@ -70,6 +79,7 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
             no_cache = payload.get("no_cache", False)
             timeout = payload.get("timeout", 20)
             raw = payload.get("raw", False)
+            readable = bool(payload.get("readable", True))
             verbose = bool(payload.get("verbose", False))
             ready_markers = payload.get("ready_markers") or None
             if isinstance(ready_markers, list):
@@ -98,9 +108,11 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
                     self._send_json({"success": True, "cached": True, "content": cached_html})
                     return
 
-            # Raw HTML is never served from the Markdown cache.
-            if not raw and not no_cache and not force_stealth:
-                cached = cache.get_cached_scrape(url)
+            # Raw HTML is never served from the Markdown cache; neither is the
+            # unformatted Markdown opt-out (different key, never cached).
+            cache_key = cache.make_markdown_cache_key(url)
+            if readable and not raw and not no_cache and not force_stealth:
+                cached = cache.get_cached_scrape(cache_key)
                 if cached:
                     self._send_json({"success": True, "cached": True, "content": cached})
                     return
@@ -117,10 +129,10 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
                                     cache.set_cached_html(url, resp.text)
                                 self._send_json({"success": True, "cached": False, "source": "primp_pool", "content": resp.text})
                                 return
-                            md = scrapepage.fast_html_to_markdown(resp.text, url)
-                            md = scrapepage.remove_long_chunks(md)
+                            md = scrapepage.fast_html_to_markdown(resp.text, url, readable=readable)
                             if len(md.strip()) >= 40:
-                                cache.set_cached_scrape(url, md)
+                                if readable:
+                                    cache.set_cached_scrape(cache_key, md)
                                 self._send_json({"success": True, "cached": False, "source": "primp_pool", "content": md})
                                 return
                 except Exception:
@@ -154,6 +166,7 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
                     force_stealth=force_stealth,
                     timeout=timeout,
                     no_cache=no_cache,
+                    readable=readable,
                 )
                 self._send_json({"success": True, "cached": False, "source": "fallback", "content": content})
             except Exception as e:

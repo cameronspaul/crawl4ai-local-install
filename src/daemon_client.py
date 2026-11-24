@@ -26,12 +26,14 @@ def daemon_scrape(
     ready_markers: tuple[str, ...] | list[str] | None = None,
     settle_wait: float | None = None,
     verbose: bool = False,
+    readable: bool = True,
     port: int = DAEMON_PORT,
 ) -> Optional[str]:
     """Dispatch scrape request to persistent warm daemon.
 
     Set ``raw=True`` to ask for the original HTML instead of Markdown and
-    ``ready_markers`` to wait for a specific client-rendered block.
+    ``ready_markers`` to wait for a specific client-rendered block. Set
+    ``readable=False`` for the old unformatted Markdown output.
     """
     payload = {
         "url": url,
@@ -40,6 +42,7 @@ def daemon_scrape(
         "no_cache": no_cache,
         "raw": raw,
         "verbose": verbose,
+        "readable": readable,
     }
     if ready_markers:
         payload["ready_markers"] = list(ready_markers)

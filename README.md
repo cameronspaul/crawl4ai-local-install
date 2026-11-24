@@ -42,10 +42,14 @@ Search options: `-n <N>` (default 10), `--news`, `-t d|w|m|y`, `--markdown` / `-
 .\scrapepage.bat https://example.com --stealth    # force the anti-bot stealth browser
 .\scrapepage.bat https://example.com --no-cache   # bypass the local cache
 .\scrapepage.bat https://example.com --html       # raw rendered HTML instead of Markdown
+.\scrapepage.bat https://example.com --preview    # before/after of the readable layout
+.\scrapepage.bat https://example.com --raw-markdown  # old unformatted Markdown output
 .\scrapepage.bat https://example.com https://example.org   # several URLs in parallel
 ```
 
 `--html` is useful when you want to run your own structured extraction (regex, an HTML parser, a JSON-LD reader) instead of reading the Markdown. Raw HTML is cached separately from Markdown for 15 minutes, so repeated structured reads stay fast; pass `--no-cache` for fresh prices or availability.
+
+Markdown output is **readable by default**: blank-line runs are collapsed to one, then the page is reordered into body text, `## Header & footer links`, and `## Images`. Every non-blank line from the original conversion is kept exactly once (including duplicates), and appendix lines are numbered with their final output line. A built-in check falls back to the de-gapped original if that guarantee is ever broken. `--raw-markdown` restores the old layout, and `--preview` prints a short before/after for a single URL. If the daemon is running, restart it after upgrading (`.\daemon.bat restart`) so it uses the new formatter.
 
 ### How scraping picks a tier
 

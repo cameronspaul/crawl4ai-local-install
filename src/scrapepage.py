@@ -3,6 +3,7 @@ import io
 import os
 import re
 import sys
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 # Ensure UTF-8 output for Windows console
@@ -16,13 +17,14 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Fast local cross-agent cache
 try:
-    from cache import get_cached_scrape, set_cached_scrape
+    from cache import get_cached_scrape, set_cached_scrape, make_markdown_cache_key
 except ImportError:
     try:
-        from src.cache import get_cached_scrape, set_cached_scrape
+        from src.cache import get_cached_scrape, set_cached_scrape, make_markdown_cache_key
     except ImportError:
         get_cached_scrape = lambda url, ttl=7200: None
         set_cached_scrape = lambda url, content: None
+        make_markdown_cache_key = lambda url: url
 
 # Persistent micro-daemon client
 try:
@@ -81,7 +83,7 @@ def set_stealth_backend(fn) -> None:
     _stealth_backend = fn
 
 
-def _try_stealth(url: str, verbose: bool, timeout: int) -> str:
+def _try_stealth(url: str, verbose: bool, timeout: int, readable: bool = True, raw_out: list | None = None) -> str:
     """Render a URL with the patched-Firefox stealth engine, or None."""
     if stealth_tier is None or not stealth_tier.available():
         if verbose:
@@ -91,11 +93,18 @@ def _try_stealth(url: str, verbose: bool, timeout: int) -> str:
     if _stealth_backend is not None:
         if verbose:
             print(f"[scrapepage] Warm stealth browser render for '{url}'", file=sys.stderr)
-        return _stealth_backend(url, timeout)
+        try:
+            return _stealth_backend(url, timeout, readable=readable)
+        except TypeError:
+            # Backwards compatibility with backends that only take (url, timeout).
+            return _stealth_backend(url, timeout)
 
     if verbose:
         print(f"[scrapepage] Stealth tier rendering '{url}' with patched Firefox...", file=sys.stderr)
-    return stealth_tier.scrape(url, fast_html_to_markdown, timeout=max(timeout, 20), verbose=verbose)
+    convert = fast_html_to_markdown
+    if not readable or raw_out is not None:
+        convert = lambda html, base: fast_html_to_markdown(html, base, readable=readable, raw_out=raw_out)
+    return stealth_tier.scrape(url, convert, timeout=max(timeout, 20), verbose=verbose)
 
 
 
@@ -139,6 +148,16 @@ def parse_args():
         action="store_true",
         help="Print raw rendered HTML instead of Markdown (useful for structured extraction)",
     )
+    parser.add_argument(
+        "--raw-markdown",
+        action="store_true",
+        help="Keep the old unformatted Markdown output instead of the readable layout",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Print a before/after comparison of the raw and readable Markdown",
+    )
     return parser.parse_args()
 
 
@@ -164,8 +183,194 @@ def remove_long_chunks(text: str, max_length: int = 1000) -> str:
     return re.sub(rf"\S{{{max_length},}}", "", text)
 
 
-def fast_html_to_markdown(html_content: str, base_url: str) -> str:
-    """Strip non-content tags, resolve links, and convert HTML to Markdown."""
+#: Internal marker placed on appendix lines before final line numbering.
+#: NUL bytes cannot occur in the Markdown we generate, so it cannot collide.
+_LINE_MARKER = "\x00LINE\x00"
+_HEADER_SECTION = "## Header & footer links"
+_IMAGE_SECTION = "## Images"
+
+
+def normalize_markdown_whitespace(markdown_text: str) -> str:
+    """De-gap Markdown without touching a single visible character.
+
+    Removes the BOM and trailing spaces and collapses any run of blank lines
+    to one. This is the only destructive step in the readable layout.
+    """
+    if not markdown_text:
+        return ""
+    kept: list[str] = []
+    for raw_line in markdown_text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.lstrip("\ufeff").rstrip()
+        if line.strip():
+            kept.append(line)
+        elif kept and kept[-1] != "":
+            kept.append("")
+    while kept and kept[-1] == "":
+        kept.pop()
+    return "\n".join(kept)
+
+
+def _line_key(line: str) -> str:
+    """Comparison key used to match a Markdown line to a DOM fragment."""
+    text = line.strip()
+    text = re.sub(r"^L\d+\s+", "", text)  # ignore numbering from a previous pass
+    text = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+|>\s*)", "", text)
+    return re.sub(r"\s+", " ", text)
+
+
+def _fragment_lines(node) -> list[str]:
+    """Render one DOM subtree with the same settings as the full page."""
+    from lxml import html as lxml_html
+    from markdownify import markdownify
+
+    try:
+        fragment = lxml_html.tostring(node, encoding="utf-8").decode("utf-8")
+        rendered = markdownify(
+            fragment,
+            heading_style="ATX",
+            strip=["script", "style", "noscript"],
+            wrap=False,
+        )
+    except Exception:
+        return []
+    return [line for line in rendered.splitlines() if line.strip()]
+
+
+def _dom_bucket_keys(tree) -> tuple[set[str], set[str]]:
+    """Collect line keys for image and nav/footer fragments.
+
+    The DOM is only used to *classify* lines. The text itself always comes
+    from the single full-page markdownify pass, so no content is re-rendered
+    or lost here.
+    """
+    image_keys: set[str] = set()
+    nav_keys: set[str] = set()
+
+    for node in tree.xpath("//img | //picture | //a[.//img]"):
+        for line in _fragment_lines(node):
+            image_keys.add(_line_key(line))
+
+    nav_xpath = (
+        "//header | //nav | //footer | "
+        "//*[@role='navigation' or @role='banner' or @role='contentinfo'] | "
+        "//a[starts-with(normalize-space(.), 'Skip to')]"
+    )
+    candidates = []
+    for node in tree.xpath(nav_xpath):
+        # Keep article titles/bodies in the main section.
+        if node.xpath(
+            "ancestor::article | ancestor::main | "
+            "ancestor::*[@role='main'] | ancestor::*[@role='article']"
+        ):
+            continue
+        if node.xpath(".//h1 | .//h2 | .//h3 | .//h4 | .//h5 | .//h6"):
+            continue
+        if len(" ".join(node.itertext()).strip()) > 4000:
+            continue
+        candidates.append(node)
+
+    # Sites without semantic tags: recognise a small footer container.
+    for node in tree.xpath("//div | //section | //ul"):
+        names = " ".join([node.get("class") or "", node.get("id") or ""]).lower()
+        if not re.search(r"(?:^|[\s_-])footer(?:[\s_-]|$)", names):
+            continue
+        if len(node.xpath(".//a")) < 2:
+            continue
+        if len(" ".join(node.itertext()).strip()) > 4000:
+            continue
+        candidates.append(node)
+
+    for node in candidates:
+        for line in _fragment_lines(node):
+            nav_keys.add(_line_key(line))
+
+    return nav_keys, image_keys
+
+
+def format_readable_markdown(
+    markdown_text: str,
+    nav_keys: set[str] | None = None,
+    image_keys: set[str] | None = None,
+    verbose: bool = False,
+) -> str:
+    """Reorder Markdown into body -> nav/footer links -> images.
+
+    Every non-blank source line is emitted exactly once, in source order
+    within its section. Only blank lines and trailing whitespace are dropped.
+    An internal assertion falls back to de-gapped Markdown if that invariant
+    is ever broken.
+    """
+    nav_keys = nav_keys or set()
+    image_keys = image_keys or set()
+    normalized = normalize_markdown_whitespace(markdown_text)
+    if not normalized:
+        return ""
+
+    source_lines = [line for line in normalized.splitlines() if line.strip()]
+    main_lines: list[str] = []
+    nav_lines: list[str] = []
+    image_lines: list[str] = []
+
+    for line in normalized.splitlines():
+        if not line.strip():
+            if main_lines and main_lines[-1] != "":
+                main_lines.append("")
+            continue
+        key = _line_key(line)
+        if key in image_keys:
+            image_lines.append(line)
+        elif key in nav_keys:
+            nav_lines.append(line)
+        else:
+            main_lines.append(line)
+
+    # Removing a block from the middle can leave two adjacent blanks.
+    collapsed_main: list[str] = []
+    for line in main_lines:
+        if not line.strip() and collapsed_main and not collapsed_main[-1].strip():
+            continue
+        collapsed_main.append(line)
+    main_lines = collapsed_main
+    while main_lines and not main_lines[0].strip():
+        main_lines.pop(0)
+    while main_lines and not main_lines[-1].strip():
+        main_lines.pop()
+
+    # Lossless guarantee: the reordered data lines must be an exact
+    # permutation of the cleaned source lines.
+    rearranged = [line for line in main_lines + nav_lines + image_lines if line.strip()]
+    if Counter(rearranged) != Counter(source_lines):
+        if verbose:
+            print("[scrapepage] Readable layout would lose content; using de-gapped Markdown", file=sys.stderr)
+        return normalized
+
+    display: list[str] = list(main_lines)
+    if nav_lines:
+        display += ["", _HEADER_SECTION, ""] + [_LINE_MARKER + line for line in nav_lines]
+    if image_lines:
+        display += ["", _IMAGE_SECTION, ""] + [_LINE_MARKER + line for line in image_lines]
+
+    numbered: list[str] = []
+    for number, line in enumerate(display, 1):
+        if line.startswith(_LINE_MARKER):
+            numbered.append(f"L{number:<5} {line[len(_LINE_MARKER):]}")
+        else:
+            numbered.append(line)
+    return "\n".join(numbered)
+
+
+def fast_html_to_markdown(
+    html_content: str,
+    base_url: str,
+    readable: bool = True,
+    raw_out: list | None = None,
+) -> str:
+    """Strip non-content tags, resolve links, and convert HTML to Markdown.
+
+    With ``readable=True`` (the default) the result is de-gapped and ordered
+    as body, header/footer links, then images. ``raw_out``, when supplied,
+    receives the untouched markdownify result for ``--preview``.
+    """
     from lxml import html as lxml_html
     from markdownify import markdownify
 
@@ -178,7 +383,14 @@ def fast_html_to_markdown(html_content: str, base_url: str) -> str:
     except Exception:
         pass
     cleaned = lxml_html.tostring(tree, encoding="utf-8").decode("utf-8")
-    return markdownify(cleaned, heading_style="ATX", strip=["script", "style", "noscript"], wrap=False)
+    md = markdownify(cleaned, heading_style="ATX", strip=["script", "style", "noscript"], wrap=False)
+    md = remove_long_chunks(md)
+    if raw_out is not None:
+        raw_out.append(md)
+    if not readable:
+        return md
+    nav_keys, image_keys = _dom_bucket_keys(tree)
+    return format_readable_markdown(md, nav_keys, image_keys)
 
 
 def try_fast_html(url: str, timeout: int = 10, min_chars: int = 200) -> tuple[bool, str]:
@@ -211,15 +423,14 @@ def try_fast_html(url: str, timeout: int = 10, min_chars: int = 200) -> tuple[bo
         return False, str(e)
 
 
-def try_fast_scrape(url: str, timeout: int = 10) -> tuple[bool, str]:
+def try_fast_scrape(url: str, timeout: int = 10, readable: bool = True, raw_out: list | None = None) -> tuple[bool, str]:
     """Attempt ultra-fast HTTP scrape using primp (Rust HTTP client with browser TLS impersonation)."""
     ok, text = try_fast_html(url, timeout=timeout, min_chars=80)
     if not ok:
         return False, text
 
     try:
-        md = fast_html_to_markdown(text, url)
-        md = remove_long_chunks(md)
+        md = fast_html_to_markdown(text, url, readable=readable, raw_out=raw_out)
         if len(md.strip()) < 40:
             return False, "Insufficient markdown extracted"
 
@@ -320,21 +531,41 @@ def scrape_html(
     )
 
 
-def scrape_single(url: str, force_stealth: bool = False, verbose: bool = False, timeout: int = 20, no_cache: bool = False) -> str:
+def scrape_single(
+    url: str,
+    force_stealth: bool = False,
+    verbose: bool = False,
+    timeout: int = 20,
+    no_cache: bool = False,
+    readable: bool = True,
+    raw_out: list | None = None,
+    use_daemon: bool = True,
+) -> str:
+    """Scrape a page to Markdown, optionally in the readable layout.
+
+    ``readable=False`` reproduces the old unformatted markdownify output.
+    ``raw_out`` receives that raw output for ``--preview``; ``use_daemon=False``
+    bypasses the daemon so the preview always sees the freshly converted text.
+    """
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
 
-    # Tier 0: Fast Cross-Agent Shared Cache (< 2ms)
-    if not no_cache and not force_stealth:
-        cached = get_cached_scrape(url)
+    cache_key = make_markdown_cache_key(url)
+
+    # Tier 0: Fast Cross-Agent Shared Cache (< 2ms). Raw output is never
+    # cached, so an opt-out request cannot be served a formatted entry.
+    if readable and not no_cache and not force_stealth:
+        cached = get_cached_scrape(cache_key)
         if cached:
             if verbose:
                 print(f"[scrapepage] Cache hit for '{url}'", file=sys.stderr)
             return cached
 
     # Tier 0.5: Persistent Micro-Daemon (warm connection pool & warm stealth browser)
-    if not os.environ.get("INSIDE_DAEMON") and is_daemon_alive():
-        daemon_res = daemon_scrape(url, timeout=timeout, no_cache=no_cache, force_stealth=force_stealth)
+    if use_daemon and not os.environ.get("INSIDE_DAEMON") and is_daemon_alive():
+        daemon_res = daemon_scrape(
+            url, timeout=timeout, no_cache=no_cache, force_stealth=force_stealth, readable=readable
+        )
         if daemon_res:
             if verbose:
                 print(f"[scrapepage] Micro-daemon served '{url}'", file=sys.stderr)
@@ -343,11 +574,12 @@ def scrape_single(url: str, force_stealth: bool = False, verbose: bool = False, 
     # Tier 1: Fast HTTP Path (Rust primp: browser TLS impersonation, no JS)
     if not force_stealth:
         fast_timeout = min(timeout, 8)
-        ok, result = try_fast_scrape(url, timeout=fast_timeout)
+        ok, result = try_fast_scrape(url, timeout=fast_timeout, readable=readable, raw_out=raw_out)
         if ok:
             if verbose:
                 print(f"[scrapepage] Fast HTTP tier succeeded for '{url}'", file=sys.stderr)
-            set_cached_scrape(url, result)
+            if readable:
+                set_cached_scrape(cache_key, result)
             return result
         if verbose:
             print(f"[scrapepage] Fast HTTP tier bypassed ({result}) for '{url}'", file=sys.stderr)
@@ -358,7 +590,7 @@ def scrape_single(url: str, force_stealth: bool = False, verbose: bool = False, 
         print(f"[scrapepage] Escalating to stealth tier for '{url}'", file=sys.stderr)
     error = None
     try:
-        content = _try_stealth(url, verbose, timeout)
+        content = _try_stealth(url, verbose, timeout, readable=readable, raw_out=raw_out)
     except Exception as e:
         content = None
         error = format_error(str(e))
@@ -366,7 +598,8 @@ def scrape_single(url: str, force_stealth: bool = False, verbose: bool = False, 
             print(f"[scrapepage] Stealth tier failed for '{url}': {error}", file=sys.stderr)
 
     if content and len(content.strip()) >= MIN_CONTENT:
-        set_cached_scrape(url, content)
+        if readable:
+            set_cached_scrape(cache_key, content)
         return content
 
     if stealth_tier is None or not stealth_tier.available():
@@ -376,6 +609,52 @@ def scrape_single(url: str, force_stealth: bool = False, verbose: bool = False, 
         )
     detail = f": {error}" if error else ""
     raise RuntimeError(f"Error: Page doesn't seem to exist. Failed to scrape. Don't attempt again. '{url}'{detail}")
+
+
+def _preview_excerpt(text: str, limit: int = 30) -> list[str]:
+    """Compress blank runs for a compact before/after display."""
+    excerpt: list[str] = []
+    blanks = 0
+    for line in text.splitlines():
+        if not line.strip():
+            blanks += 1
+            continue
+        if blanks:
+            excerpt.append(f"    ... {blanks} blank line(s) ...")
+            blanks = 0
+        excerpt.append(line)
+        if len(excerpt) >= limit:
+            break
+    return excerpt
+
+
+def format_preview(raw: str, readable: str) -> str:
+    """Build a short before/after comparison for ``--preview``."""
+    raw_lines = raw.splitlines()
+    blank_runs: list[int] = []
+    run = 0
+    for line in raw_lines:
+        if not line.strip():
+            run += 1
+        elif run:
+            blank_runs.append(run)
+            run = 0
+    if run:
+        blank_runs.append(run)
+
+    stats = [
+        f"raw lines:       {len(raw_lines)}",
+        f"blank lines:     {sum(1 for line in raw_lines if not line.strip())}",
+        f"longest gap:     {max(blank_runs) if blank_runs else 0} blank lines",
+        f"readable lines:  {len(readable.splitlines())}",
+    ]
+    out = ["=" * 78, "BEFORE - raw markdownify output", "=" * 78, *stats, ""]
+    out += _preview_excerpt(raw)
+    out += ["", "=" * 78, "AFTER - readable layout (start)", "=" * 78]
+    out += _preview_excerpt(readable, 26)
+    out += ["", "    ...", "=" * 78, "AFTER - readable layout (end: appendices)", "=" * 78]
+    out += readable.splitlines()[-14:]
+    return "\n".join(out)
 
 
 def main():
@@ -404,6 +683,12 @@ def main():
             joined.append(arg)
     urls = joined
 
+    if args.preview and (len(urls) != 1 or args.html):
+        print(
+            "[scrapepage] --preview only applies to a single Markdown page; ignoring it here.",
+            file=sys.stderr,
+        )
+
     def fetch(u: str) -> str:
         if args.html:
             return scrape_html(
@@ -419,13 +704,29 @@ def main():
             verbose=args.verbose,
             timeout=args.timeout,
             no_cache=args.no_cache,
+            readable=not args.raw_markdown,
         )
 
     # Single URL: output directly without headers for seamless piping and backwards compatibility
     if len(urls) == 1:
         try:
-            content = fetch(urls[0])
-            print(content)
+            if args.preview and not args.html:
+                raw_out: list[str] = []
+                content = scrape_single(
+                    urls[0],
+                    force_stealth=args.stealth,
+                    verbose=args.verbose,
+                    timeout=args.timeout,
+                    no_cache=True,
+                    readable=True,
+                    raw_out=raw_out,
+                    use_daemon=False,
+                )
+                raw = raw_out[0] if raw_out else None
+                print(format_preview(raw, content) if raw is not None else content)
+            else:
+                content = fetch(urls[0])
+                print(content)
         except KeyboardInterrupt:
             print("\nOperation cancelled by user.", file=sys.stderr)
             sys.exit(130)
