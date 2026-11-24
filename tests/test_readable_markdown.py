@@ -156,13 +156,6 @@ class ConversionTests(unittest.TestCase):
         self.assertIn("[Home](https://example.com/home)", raw)
         self.assertIn("![A picture](https://example.com/pic.png)", raw)
 
-    def test_raw_out_captures_pre_layout_markdown(self):
-        captured = []
-        out = scrapepage.fast_html_to_markdown(HTML_FIXTURE, "https://example.com/", raw_out=captured)
-        self.assertEqual(len(captured), 1)
-        self.assertNotEqual(captured[0], out)
-        self.assertEqual(data_counter(captured[0]), data_counter(out, strip_numbers=True))
-
 
 class CacheKeyTests(unittest.TestCase):
     def test_markdown_cache_key_is_versioned(self):
