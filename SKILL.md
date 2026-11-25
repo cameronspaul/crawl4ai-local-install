@@ -23,7 +23,7 @@ Run one or more searches with `websearch.bat`. Search more than once with differ
 .\websearch.bat "your topic query"
 ```
 
-`websearch.bat` always returns at least one result. `stale: true` means last successful results; `fallback: true` means direct search links — treat those as navigation, not evidence.
+`websearch.bat` always returns at least one result. `stale: true` means last successful results; `fallback: true` means direct search links — treat those as navigation, not evidence. Typos are auto-corrected and site words (e.g. `reddit`) bias results to that domain.
 
 Useful options:
 - `-n <N>` — number of results (default 10).

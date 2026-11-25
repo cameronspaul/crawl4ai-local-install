@@ -1,4 +1,5 @@
 import argparse
+import difflib
 import io
 import json
 import os
@@ -9,8 +10,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
+import primp
 from ddgs import DDGS
 
 # Persistent micro-daemon client
@@ -70,6 +72,20 @@ SEARCH_TIMEOUT = 5       # per-engine HTTP timeout passed to DDGS
 FIRST_WAVE_WAIT = 2.6    # seconds before giving up on the preferred engines
 SECOND_WAVE_WAIT = 3.0   # seconds for the remaining engines / auto
 MERGE_GRACE = 0.4        # short window to merge extra engines after a winner
+
+# Query understanding (what Google does implicitly): site hints, typo fixes and
+# relevance reranking of results merged from several engines.
+SITE_HINTS = {
+    "reddit": "reddit.com", "youtube": "youtube.com", "github": "github.com",
+    "wikipedia": "wikipedia.org", "steam": "steampowered.com", "amazon": "amazon.",
+    "stackoverflow": "stackoverflow.com", "quora": "quora.com", "tiktok": "tiktok.com",
+    "facebook": "facebook.com", "x": "x.com", "medium": "medium.com",
+}
+QUERY_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "at", "is",
+    "are", "was", "with", "my", "me", "how", "do", "does", "what", "why", "best",
+}
+_SPELL_CACHE = {}
 
 # Regex to capture leading dates in search snippets (e.g. "Aug 3, 2026 ·", "2 days ago ·", "2024-05-12 ·")
 DATE_PREFIX_REGEX = re.compile(
@@ -168,6 +184,135 @@ def sort_by_date(results):
     return sorted(results, key=key, reverse=True)
 
 
+def _suggest_spelling(token):
+    """Ask autocomplete for a likely correction of a single misspelled word."""
+    if token in _SPELL_CACHE:
+        return _SPELL_CACHE[token]
+    endpoints = (
+        "https://duckduckgo.com/ac/?q=" + quote(token) + "&type=list",
+        "https://suggestqueries.google.com/complete/search?client=chrome&q=" + quote(token),
+    )
+    found = ""
+    for url in endpoints:
+        suggestions = []
+        try:
+            data = json.loads(primp.Client(impersonate="chrome", timeout=3).get(url).text)
+            suggestions = data[1] if isinstance(data, list) and len(data) > 1 else []
+        except Exception:
+            continue
+        for suggestion in suggestions:
+            words = re.findall(r"\w+", str(suggestion).lower())
+            if not words:
+                continue
+            candidate = words[0]
+            ratio = difflib.SequenceMatcher(None, token, candidate).ratio()
+            if candidate != token and ratio >= 0.75 and abs(len(candidate) - len(token)) <= 3:
+                found = candidate
+                break
+        if found or suggestions:
+            break
+    _SPELL_CACHE[token] = found
+    return found
+
+
+def corrected_queries(query):
+    """Return reformulations of a query, e.g. a misspelling fixed via autocomplete."""
+    tokens = re.findall(r"\w+", query)
+    if not tokens:
+        return []
+    fixes = {}
+    candidates = sorted(
+        (t for t in set(tokens) if len(t) >= 6 and t.isalpha()
+         and t.lower() not in QUERY_STOPWORDS and t.lower() not in SITE_HINTS),
+        key=len, reverse=True,
+    )[:2]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [(token, executor.submit(_suggest_spelling, token.lower())) for token in candidates]
+        for token, future in futures:
+            suggestion = future.result()
+            if suggestion:
+                fixes[token] = suggestion
+    if not fixes:
+        return []
+    fixed = " ".join(fixes.get(token, token) for token in tokens)
+    return [fixed] if fixed.lower() != query.lower() else []
+
+
+def detect_site_hint(query):
+    """'reddit' in a query behaves like site:reddit.com to users."""
+    explicit = re.search(r"\bsite:([^\s]+)", query, re.IGNORECASE)
+    if explicit:
+        return explicit.group(1).lower()
+    lowered = query.lower()
+    for word, domain in SITE_HINTS.items():
+        if re.search(rf"\b{re.escape(word)}\b", lowered):
+            return domain
+    return None
+
+
+def query_tokens(query):
+    return {
+        token for token in re.findall(r"\w+", query.lower())
+        if len(token) > 1 and token not in QUERY_STOPWORDS and not token.startswith("site:")
+    }
+
+
+def relevance_score(row, query, site_hint=None, recency=False):
+    """Score a result against the query that produced it and any site hint."""
+    source_query = row.get("_query") or query
+    tokens = query_tokens(source_query)
+    title = str(row.get("title") or "").lower()
+    snippet = str(row.get("body") or row.get("snippet") or "").lower()
+    url = str(row.get("href") or row.get("url") or "").lower()
+
+    score = 0.0
+    phrase = " ".join(
+        token for token in re.findall(r"\w+", source_query.lower()) if token in tokens
+    )
+    if phrase and phrase in re.sub(r"\W+", " ", title + " " + snippet):
+        score += 8
+    for token in tokens:
+        if token in title:
+            score += 3
+        if token in snippet:
+            score += 1
+        if token in url:
+            score += 1
+    if tokens:
+        coverage = sum(1 for t in tokens if t in title or t in snippet) / len(tokens)
+        score += coverage * 6
+    if site_hint:
+        domain = urlparse(url).netloc.lower() if url else ""
+        if site_hint in domain:
+            score += 14
+        elif site_hint in title or site_hint in snippet:
+            score += 2
+    timestamp = date_to_timestamp(row.get("date") or "")
+    if timestamp is not None:
+        score += 2
+        if recency:
+            score += max(0.0, 6 - (time.time() - timestamp) / 604800)
+    return score
+
+
+def rank_and_dedupe(rows, query, site_hint=None, recency=False):
+    """Sort merged results by relevance, dropping duplicate URLs."""
+    scored = [
+        (relevance_score(row, query, site_hint, recency), index, row)
+        for index, row in enumerate(rows)
+    ]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    seen = set()
+    ranked = []
+    for _, _, row in scored:
+        key = row.get("href") or row.get("url") or row.get("title", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append(row)
+    return ranked
+
+
 def available_backends(category: str = "text") -> list[str]:
     """Backends actually enabled in the installed DDGS version."""
     try:
@@ -216,7 +361,7 @@ def _direct_engine_rows(engine_name, query, kwargs, timeout):
     return []
 
 
-def _race_backends(query, category, backends, kwargs, timeout, wait_seconds, want):
+def _race_backends(query, category, backends, kwargs, timeout, wait_seconds, want, extra_queries=()):
     """Race independent single-backend DDGS calls and keep what succeeds.
 
     DDGS's own multi-backend call can silently discard good results when one
@@ -227,34 +372,44 @@ def _race_backends(query, category, backends, kwargs, timeout, wait_seconds, wan
     we stop as soon as enough results have arrived.
     """
     out = queue.Queue()
+    # Reformulated queries (e.g. a typo fix) race on the two fastest engines.
+    # They need a slightly longer window so a fast original query cannot fill
+    # the quota before the corrected results arrive.
+    grace = 0.8 if extra_queries else MERGE_GRACE
+    if extra_queries:
+        wait_seconds = min(wait_seconds, 1.2)
+    tasks = [(query, backend) for backend in backends]
+    for extra in extra_queries:
+        tasks.extend((extra, backend) for backend in backends[:2])
 
-    def worker(backend):
+    def worker(task):
+        task_query, backend = task
         try:
             if backend.startswith("direct:"):
-                rows = _direct_engine_rows(backend.split(":", 1)[1], query, kwargs, timeout)
+                rows = _direct_engine_rows(backend.split(":", 1)[1], task_query, kwargs, timeout)
             else:
                 ddgs = DDGS(timeout=timeout)
                 if category == "news":
-                    rows = list(ddgs.news(query, backend=backend, **kwargs))
+                    rows = list(ddgs.news(task_query, backend=backend, **kwargs))
                     for row in rows:
                         if "url" in row and "href" not in row:
                             row["href"] = row["url"]
                 else:
-                    rows = list(ddgs.text(query, backend=backend, **kwargs))
+                    rows = list(ddgs.text(task_query, backend=backend, **kwargs))
         except Exception:
             rows = []
-        out.put((backend, rows))
+        out.put((task_query, rows))
 
-    for backend in backends:
-        threading.Thread(target=worker, args=(backend,), daemon=True).start()
+    for task in tasks:
+        threading.Thread(target=worker, args=(task,), daemon=True).start()
 
     deadline = time.monotonic() + wait_seconds
     seen = set()
     collected = []
-    pending = len(backends)
+    pending = len(tasks)
     while pending and time.monotonic() < deadline:
         try:
-            _, rows = out.get(timeout=max(0.01, deadline - time.monotonic()))
+            task_query, rows = out.get(timeout=max(0.01, deadline - time.monotonic()))
         except queue.Empty:
             break
         pending -= 1
@@ -262,21 +417,24 @@ def _race_backends(query, category, backends, kwargs, timeout, wait_seconds, wan
             continue
         # A winner arrived: give the other engines a brief chance to add more
         # results, but never stretch the response beyond the grace window.
-        deadline = min(deadline, time.monotonic() + MERGE_GRACE)
+        deadline = min(deadline, time.monotonic() + grace)
         for row in rows:
+            if not isinstance(row, dict):
+                row = _result_to_dict(row)
             key = row.get("href") or row.get("url") or row.get("title", "")
             if key and key in seen:
                 continue
             if key:
                 seen.add(key)
+            row["_query"] = task_query
             collected.append(row)
-        if len(collected) >= want:
+        if len(collected) >= want and not extra_queries:
             break
 
     return collected
 
 
-def _live_search(query, max_results, search_type, region, timelimit, backend):
+def _live_search(query, max_results, search_type, region, timelimit, backend, recent=False):
     """Fetch raw results using two fast waves of racing engines."""
     kwargs = {"max_results": max_results}
     # Only pass region if non-default to prevent unnecessary DDGS region-routing delay
@@ -308,14 +466,21 @@ def _live_search(query, max_results, search_type, region, timelimit, backend):
             secondary.insert(0, f"direct:{DIRECT_TEXT_ENGINES[0]}")
         secondary.append("auto")
 
+    extra = corrected_queries(query) if category == "text" else []
+    site_hint = detect_site_hint(query)
     rows = _race_backends(
-        query, category, primary, kwargs, SEARCH_TIMEOUT, FIRST_WAVE_WAIT, max_results
+        query, category, primary, kwargs, SEARCH_TIMEOUT, FIRST_WAVE_WAIT, max_results,
+        extra_queries=extra,
     )
     if not rows and secondary:
         rows = _race_backends(
-            query, category, secondary, kwargs, SEARCH_TIMEOUT + 2, SECOND_WAVE_WAIT, max_results
+            query, category, secondary, kwargs, SEARCH_TIMEOUT + 2, SECOND_WAVE_WAIT, max_results,
+            extra_queries=extra,
         )
-    return rows[:max_results]
+    ranked = rank_and_dedupe(
+        rows, query, site_hint, recency=recent or bool(timelimit)
+    )
+    return ranked[:max_results]
 
 
 def _process_results(raw_results):
@@ -405,7 +570,7 @@ def search(
 
     try:
         raw_results = _live_search(
-            query, max_results, search_type, region, timelimit, backend
+            query, max_results, search_type, region, timelimit, backend, recent
         )
     except Exception:
         raw_results = []

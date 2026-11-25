@@ -32,6 +32,8 @@ Search options: `-n <N>` (default 10), `--news`, `-t d|w|m|y`, `--recent`, `--ma
 
 Search always returns something: engines are raced in parallel (~1 s), Bing first, Yahoo/`auto` as fallbacks. If all fail, it serves last successful results (`stale: true`) or direct search links (`fallback: true`). Requires `ddgs>=9.16.1` ([ddgs#427](https://github.com/deedy5/ddgs/issues/427)).
 
+Queries are spell-corrected via autocomplete, words like `reddit` bias results to that site, and merged results are reranked by title/snippet match and specificity instead of engine arrival order.
+
 ### 🕷️ Scrape a Page (`scrapepage.bat`)
 
 **Scrape page to Markdown:**

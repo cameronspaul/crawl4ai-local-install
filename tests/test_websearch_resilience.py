@@ -107,6 +107,33 @@ class SearchResponseTests(unittest.TestCase):
         self.assertFalse(results[0].get("fallback"))
 
 
+class QueryUnderstandingTests(unittest.TestCase):
+    def test_typo_is_corrected_into_a_reformulated_query(self):
+        with patch.object(websearch, "_suggest_spelling", lambda token: "unofficial" if token == "unoficcal" else ""):
+            variants = websearch.corrected_queries("gta 6 unoficcal pc port reddit")
+        self.assertEqual(variants, ["gta 6 unofficial pc port reddit"])
+
+    def test_no_reformulation_when_spelling_is_fine(self):
+        with patch.object(websearch, "_suggest_spelling", lambda token: token):
+            self.assertEqual(websearch.corrected_queries("python asyncio tutorial"), [])
+
+    def test_site_hints_from_word_and_operator(self):
+        self.assertEqual(websearch.detect_site_hint("gta 6 pc port reddit"), "reddit.com")
+        self.assertEqual(websearch.detect_site_hint("site:github.com ffmpeg"), "github.com")
+        self.assertIsNone(websearch.detect_site_hint("python asyncio tutorial"))
+
+    def test_relevance_ranking_prefers_specific_site_results_and_dedupes(self):
+        generic = {"title": "Grand Theft Auto V", "body": "Rockstar games", "href": "https://rockstargames.com/gta-v"}
+        specific = {
+            "title": "GTA 6 unofficial PC port", "body": "reddit discussion",
+            "href": "https://www.reddit.com/r/GTA6/comments/1", "date": "2 days ago",
+        }
+        query = "gta 6 unofficial pc port reddit"
+        ranked = websearch.rank_and_dedupe([generic, specific, dict(specific)], query, "reddit.com")
+        self.assertEqual(len(ranked), 2)
+        self.assertIn("reddit.com", ranked[0]["href"])
+
+
 class RecentDateTests(unittest.TestCase):
     def test_date_to_timestamp_handles_relative_and_absolute_dates(self):
         now = time.time()
