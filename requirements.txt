@@ -1,4 +1,4 @@
-ddgs
+ddgs>=9.16.1
 invisible-playwright
 lxml
 markdownify

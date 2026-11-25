@@ -2,10 +2,15 @@ import argparse
 import io
 import json
 import os
+import queue
 import re
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
+from datetime import datetime, timezone
+from urllib.parse import urlencode, urlparse
+
 from ddgs import DDGS
 
 # Persistent micro-daemon client
@@ -20,14 +25,28 @@ except ImportError:
 
 # Fast local cross-agent cache
 try:
-    from cache import get_cached_search, set_cached_search, make_search_key
+    from cache import (
+        get_cached_search,
+        set_cached_search,
+        make_search_key,
+        get_last_good_search,
+        set_last_good_search,
+    )
 except ImportError:
     try:
-        from src.cache import get_cached_search, set_cached_search, make_search_key
+        from src.cache import (
+            get_cached_search,
+            set_cached_search,
+            make_search_key,
+            get_last_good_search,
+            set_last_good_search,
+        )
     except ImportError:
         get_cached_search = lambda key, ttl=1800: None
         set_cached_search = lambda key, results: None
         make_search_key = lambda *args: ""
+        get_last_good_search = lambda query, search_type="text": None
+        set_last_good_search = lambda query, results, search_type="text": None
 
 # Ensure UTF-8 output for Windows console
 if sys.stdout.encoding != "utf-8":
@@ -36,8 +55,21 @@ if sys.stdout.encoding != "utf-8":
     except Exception:
         pass
 
-# Fast web search backends (skips Wikipedia/Grokipedia sequential bottleneck in auto mode)
-FAST_TEXT_BACKENDS = "yahoo,yandex,brave,duckduckgo,startpage,mojeek"
+# Each engine is called on its own (see _race_backends), so this list is only
+# the preferred first wave. Engines unavailable in the installed DDGS version
+# are skipped automatically.
+FAST_TEXT_BACKENDS = ("yahoo", "duckduckgo", "brave", "startpage", "mojeek")
+FAST_NEWS_BACKENDS = ("bing", "yahoo", "duckduckgo")
+
+# DDGS 9.16.1 marks the Bing text engine as disabled, so it is absent from the
+# registry. Its class still works, however, and it is the fastest text provider
+# here (~0.25 s). Call it directly (as "direct:bing") before the registry ones.
+DIRECT_TEXT_ENGINES = ("bing",)
+
+SEARCH_TIMEOUT = 5       # per-engine HTTP timeout passed to DDGS
+FIRST_WAVE_WAIT = 2.6    # seconds before giving up on the preferred engines
+SECOND_WAVE_WAIT = 3.0   # seconds for the remaining engines / auto
+MERGE_GRACE = 0.4        # short window to merge extra engines after a winner
 
 # Regex to capture leading dates in search snippets (e.g. "Aug 3, 2026 ·", "2 days ago ·", "2024-05-12 ·")
 DATE_PREFIX_REGEX = re.compile(
@@ -65,35 +97,187 @@ def extract_date_and_clean_body(body: str, raw_date: str = None) -> tuple[str, s
     return date, clean_body
 
 
-def search(
-    query: str,
-    max_results: int = 10,
-    search_type: str = "text",
-    region: str = None,
-    timelimit: str = None,
-    backend: str = "fast",
-    no_cache: bool = False,
-):
-    cache_key = make_search_key(query, search_type, max_results, region, backend)
-    if not no_cache:
-        cached = get_cached_search(cache_key)
-        if cached:
-            return cached
+_DATE_UNITS = {
+    "sec": 1, "second": 1,
+    "min": 60, "minute": 60,
+    "hr": 3600, "hour": 3600,
+    "day": 86400, "week": 604800,
+    "month": 2592000, "year": 31536000,
+}
+_RELATIVE_DATE_RE = re.compile(
+    r'(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?)\s+ago',
+    re.IGNORECASE,
+)
+_MONTH_DATE_RE = re.compile(
+    r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b',
+    re.IGNORECASE,
+)
+_ISO_DATE_RE = re.compile(r'\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2})?')
 
-    # Persistent micro-daemon path (warm pooled HTTP client)
-    if not os.environ.get("INSIDE_DAEMON") and is_daemon_alive() and not timelimit:
-        daemon_res = daemon_search(
-            query=query,
-            max_results=max_results,
-            search_type=search_type,
-            region=region,
-            backend=backend,
-            no_cache=no_cache,
+
+def date_to_timestamp(value):
+    """Turn a result date ('35 minutes ago', 'Nov 24, 2026', ISO) into an epoch."""
+    if not value:
+        return None
+    text = str(value).strip()
+    now = time.time()
+
+    match = _RELATIVE_DATE_RE.search(text)
+    if match:
+        unit = match.group(2).lower().rstrip("s")
+        if unit == "sec":
+            unit = "second"
+        elif unit == "min":
+            unit = "minute"
+        elif unit == "hr":
+            unit = "hour"
+        multiplier = _DATE_UNITS.get(unit)
+        if multiplier:
+            return now - int(match.group(1)) * multiplier
+
+    if re.search(r"\byesterday\b", text, re.IGNORECASE):
+        return now - 86400
+    if re.search(r"\btoday\b", text, re.IGNORECASE):
+        return now
+
+    match = _ISO_DATE_RE.search(text)
+    if match:
+        try:
+            return datetime.fromisoformat(
+                match.group(0).replace(" ", "T")[:19]
+            ).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+
+    match = _MONTH_DATE_RE.search(text)
+    if match:
+        raw = match.group(0).replace(",", "")
+        for fmt in ("%b %d %Y", "%B %d %Y"):
+            try:
+                return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                pass
+    return None
+
+
+def sort_by_date(results):
+    """Newest first; results without a parseable date stay at the end."""
+    def key(result):
+        ts = date_to_timestamp(result.get("date"))
+        return (ts is not None, ts or 0)
+    return sorted(results, key=key, reverse=True)
+
+
+def available_backends(category: str = "text") -> list[str]:
+    """Backends actually enabled in the installed DDGS version."""
+    try:
+        from ddgs.engines import ENGINES
+        return [
+            name for name in ENGINES.get(category, {})
+            if name not in ("wikipedia", "grokipedia")
+        ]
+    except Exception:
+        return list(FAST_NEWS_BACKENDS if category == "news" else FAST_TEXT_BACKENDS)
+
+
+def _result_to_dict(row):
+    """Convert a DDGS result (dict or dataclass) to a plain dict."""
+    if isinstance(row, dict):
+        return row
+    if hasattr(row, "_asdict"):
+        return row._asdict()
+    return {
+        key: getattr(row, key, "")
+        for key in ("title", "href", "url", "body", "date", "source")
+    }
+
+
+def _direct_engine_rows(engine_name, query, kwargs, timeout):
+    """Call a disabled-but-working DDGS engine class directly."""
+    if engine_name == "bing":
+        from ddgs.engines.bing import Bing
+
+        rows = Bing(
+            proxy=None, timeout=timeout, verify=True
+        ).search(
+            query,
+            region=kwargs.get("region", "us-en"),
+            safesearch="moderate",
+            timelimit=kwargs.get("timelimit"),
+            page=1,
         )
-        if daemon_res is not None:
-            return daemon_res
+        out = []
+        for row in rows:
+            item = _result_to_dict(row)
+            # Bing mixes in ad rows with no destination; drop those.
+            if item.get("href") or item.get("url"):
+                out.append(item)
+        return out
+    return []
 
-    ddgs = DDGS()
+
+def _race_backends(query, category, backends, kwargs, timeout, wait_seconds, want):
+    """Race independent single-backend DDGS calls and keep what succeeds.
+
+    DDGS's own multi-backend call can silently discard good results when one
+    engine raises first (deedy5/ddgs#427), and any one engine may be
+    rate-limited at a given moment. Calling engines separately and taking the
+    first successful responses makes both failures harmless: a single bad
+    engine can never blank out the others, and the response stays fast because
+    we stop as soon as enough results have arrived.
+    """
+    out = queue.Queue()
+
+    def worker(backend):
+        try:
+            if backend.startswith("direct:"):
+                rows = _direct_engine_rows(backend.split(":", 1)[1], query, kwargs, timeout)
+            else:
+                ddgs = DDGS(timeout=timeout)
+                if category == "news":
+                    rows = list(ddgs.news(query, backend=backend, **kwargs))
+                    for row in rows:
+                        if "url" in row and "href" not in row:
+                            row["href"] = row["url"]
+                else:
+                    rows = list(ddgs.text(query, backend=backend, **kwargs))
+        except Exception:
+            rows = []
+        out.put((backend, rows))
+
+    for backend in backends:
+        threading.Thread(target=worker, args=(backend,), daemon=True).start()
+
+    deadline = time.monotonic() + wait_seconds
+    seen = set()
+    collected = []
+    pending = len(backends)
+    while pending and time.monotonic() < deadline:
+        try:
+            _, rows = out.get(timeout=max(0.01, deadline - time.monotonic()))
+        except queue.Empty:
+            break
+        pending -= 1
+        if not rows:
+            continue
+        # A winner arrived: give the other engines a brief chance to add more
+        # results, but never stretch the response beyond the grace window.
+        deadline = min(deadline, time.monotonic() + MERGE_GRACE)
+        for row in rows:
+            key = row.get("href") or row.get("url") or row.get("title", "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            collected.append(row)
+        if len(collected) >= want:
+            break
+
+    return collected
+
+
+def _live_search(query, max_results, search_type, region, timelimit, backend):
+    """Fetch raw results using two fast waves of racing engines."""
     kwargs = {"max_results": max_results}
     # Only pass region if non-default to prevent unnecessary DDGS region-routing delay
     if region and region != "wt-wt":
@@ -101,30 +285,41 @@ def search(
     if timelimit:
         kwargs["timelimit"] = timelimit
 
-    if search_type == "news":
-        raw_results = list(ddgs.news(query, **kwargs))
-        for r in raw_results:
-            if "url" in r and "href" not in r:
-                r["href"] = r["url"]
+    category = "news" if search_type == "news" else "text"
+    available = available_backends(category)
+    preferred = FAST_NEWS_BACKENDS if category == "news" else FAST_TEXT_BACKENDS
+
+    if backend and backend not in ("fast", "auto", "all"):
+        requested = [b.strip() for b in backend.split(",") if b.strip()]
+        # An explicit "bing" text request uses the direct engine class, since
+        # DDGS 9.16.1 no longer lists it in the text registry.
+        primary = [
+            f"direct:{b}" if category == "text" and b == "bing" else b
+            for b in requested
+        ]
+        primary = [b for b in primary if b.startswith("direct:") or b in available] or requested
     else:
-        # Fast path for text search: prioritize general web engines over Wikipedia/Grokipedia
-        raw_results = []
-        target_backend = FAST_TEXT_BACKENDS if backend == "fast" else backend
+        direct = [f"direct:{name}" for name in DIRECT_TEXT_ENGINES] if category == "text" else []
+        primary = direct + [b for b in preferred if b in available] or available[:3] or ["auto"]
 
-        if target_backend:
-            try:
-                raw_results = list(ddgs.text(query, backend=target_backend, **kwargs))
-            except Exception:
-                raw_results = []
+    secondary = [b for b in available if b not in primary]
+    if category == "text":
+        if not any(b.startswith("direct:") for b in primary):
+            secondary.insert(0, f"direct:{DIRECT_TEXT_ENGINES[0]}")
+        secondary.append("auto")
 
-        # Automatic fallback to 'auto' if fast backends didn't yield results
-        if not raw_results and (backend == "fast" or not target_backend):
-            try:
-                raw_results = list(ddgs.text(query, backend="auto", **kwargs))
-            except Exception:
-                raw_results = []
+    rows = _race_backends(
+        query, category, primary, kwargs, SEARCH_TIMEOUT, FIRST_WAVE_WAIT, max_results
+    )
+    if not rows and secondary:
+        rows = _race_backends(
+            query, category, secondary, kwargs, SEARCH_TIMEOUT + 2, SECOND_WAVE_WAIT, max_results
+        )
+    return rows[:max_results]
 
-    # Process results with cleaned dates and metadata
+
+def _process_results(raw_results):
+    """Normalize DDGS rows into the CLI's result shape."""
     processed_results = []
     for r in raw_results:
         url = r.get("href", "").strip()
@@ -148,11 +343,97 @@ def search(
             "source": r.get("source", ""),
             "snippet": clean_body,
         })
-
-    if processed_results and not no_cache:
-        set_cached_search(cache_key, processed_results)
-
     return processed_results
+
+
+def _fallback_results(query):
+    """Last-resort direct search links, so a query never returns nothing."""
+    encoded = urlencode({"q": query})
+    links = (
+        ("Google", "https://www.google.com/search?" + encoded, "google.com"),
+        ("Bing", "https://www.bing.com/search?" + encoded, "bing.com"),
+        ("DuckDuckGo", "https://duckduckgo.com/?" + encoded, "duckduckgo.com"),
+    )
+    return [
+        {
+            "title": f'{name} search for "{query}"',
+            "url": url,
+            "site": site,
+            "date": None,
+            "source": "search-fallback",
+            "snippet": "Live search is temporarily unavailable. Open this link to run the search directly.",
+            "fallback": True,
+        }
+        for name, url, site in links
+    ]
+
+
+def search(
+    query: str,
+    max_results: int = 10,
+    search_type: str = "text",
+    region: str = None,
+    timelimit: str = None,
+    backend: str = "fast",
+    no_cache: bool = False,
+    recent: bool = False,
+):
+    def finish(results):
+        return sort_by_date(results) if recent else results
+
+    cache_key = make_search_key(query, search_type, max_results, region, backend)
+    if not no_cache:
+        cached = get_cached_search(cache_key)
+        if cached:
+            return finish(cached)
+
+    # Persistent micro-daemon path (warm pooled HTTP client). Only accept a
+    # non-empty result: an empty daemon result must fall through to the local
+    # resilient search instead of ending the query with no content. Recency
+    # sorting is done here, so bypass the daemon for those requests.
+    if not os.environ.get("INSIDE_DAEMON") and is_daemon_alive() and not timelimit and not recent:
+        daemon_res = daemon_search(
+            query=query,
+            max_results=max_results,
+            search_type=search_type,
+            region=region,
+            backend=backend,
+            no_cache=no_cache,
+        )
+        if daemon_res:
+            return finish(daemon_res)
+
+    try:
+        raw_results = _live_search(
+            query, max_results, search_type, region, timelimit, backend
+        )
+    except Exception:
+        raw_results = []
+
+    processed_results = _process_results(raw_results)
+    if processed_results:
+        if not no_cache:
+            set_cached_search(cache_key, processed_results)
+            set_last_good_search(query, processed_results, search_type)
+        return finish(processed_results)
+
+    # Every live engine failed. Serve the last successful results for this
+    # query (any age) before resorting to direct search links.
+    if not no_cache:
+        stale = get_last_good_search(query, search_type)
+        if stale:
+            for result in stale:
+                result["stale"] = True
+            return finish(stale[:max_results])
+
+    return finish(_fallback_results(query)[:max_results])
+
+
+def _output_notice(results):
+    if any(r.get("fallback") for r in results):
+        print("* Live search is unavailable right now — showing direct search links instead. *\n")
+    elif any(r.get("stale") for r in results):
+        print("* Live search is unavailable right now — showing the last successful results for this query. *\n")
 
 
 def print_clean_list(results, query: str):
@@ -160,6 +441,7 @@ def print_clean_list(results, query: str):
         print(f"\nNo results found for: \"{query}\"\n")
         return
 
+    _output_notice(results)
     print(f"\nSearch results for \"{query}\" ({len(results)} results):\n")
 
     for idx, r in enumerate(results, 1):
@@ -178,6 +460,7 @@ def print_clean_list(results, query: str):
 
 
 def print_markdown_results(results, query: str):
+    _output_notice(results)
     print(f"# Search Results: {query}\n")
     for idx, r in enumerate(results, 1):
         print(f"### {idx}. [{r['title']}]({r['url']})")
@@ -200,6 +483,7 @@ def parse_args():
   websearch "python asyncio tutorial"
   websearch "python web scraping" 5
   websearch "ai technology" --news
+  websearch "ai technology" --news --recent
   websearch "fastapi" --json
 """
     )
@@ -255,6 +539,11 @@ def parse_args():
         action="store_true",
         help="Bypass local cache and perform live search",
     )
+    parser.add_argument(
+        "--recent",
+        action="store_true",
+        help="Prefer the newest results: ask engines for the last week (unless -t is given) and sort by date, newest first",
+    )
 
     args = parser.parse_args()
 
@@ -271,6 +560,9 @@ def parse_args():
         queries = raw_queries
 
     args.queries = queries
+
+    if args.recent and args.time is None:
+        args.time = "w"
 
     if args.json:
         args.format = "json"
@@ -295,6 +587,7 @@ def main():
                 timelimit=args.time,
                 backend=args.backend,
                 no_cache=args.no_cache,
+                recent=args.recent,
             )
         except Exception as e:
             print(f"Search failed: {e}", file=sys.stderr)
@@ -320,6 +613,7 @@ def main():
                 timelimit=args.time,
                 backend=args.backend,
                 no_cache=args.no_cache,
+                recent=args.recent,
             ), None
         except Exception as err:
             return q, [], str(err)

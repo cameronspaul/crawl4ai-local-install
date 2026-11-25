@@ -1,6 +1,6 @@
 # Webscrape CLI Tools
 
-Minimal CLI tools to scrape web pages to Markdown (or raw HTML) and search the web using DuckDuckGo ([DDGS](https://github.com/deedy5/ddgs)) plus an anti-bot stealth engine ([invisible_playwright](https://github.com/feder-cr/invisible_playwright), a patched anti-detect Firefox).
+Minimal CLI tools to scrape web pages to Markdown (or raw HTML) and search the web via [DDGS](https://github.com/deedy5/ddgs) (Bing, Yahoo, others), plus an anti-bot stealth engine ([invisible_playwright](https://github.com/feder-cr/invisible_playwright), a patched anti-detect Firefox).
 
 ## Setup
 
@@ -26,7 +26,11 @@ IMPORTANT NOTE - If a page still can't be scraped, don't try anything else (no a
 .\websearch.bat "latest travel rule" --news -t w
 ```
 
-Search options: `-n <N>` (default 10), `--news`, `-t d|w|m|y`, `--markdown` / `--json`, `-r <region>` (e.g. `uk-en`), `--no-cache` / `--fresh`.
+Search options: `-n <N>` (default 10), `--news`, `-t d|w|m|y`, `--recent`, `--markdown` / `--json`, `-r <region>` (e.g. `uk-en`), `--no-cache` / `--fresh`.
+
+`--recent` asks for the last week (unless `-t` is given) and sorts by date, newest first. `-t` is only a hint to engines; use `--news` when recency matters, since news results carry real dates.
+
+Search always returns something: engines are raced in parallel (~1 s), Bing first, Yahoo/`auto` as fallbacks. If all fail, it serves last successful results (`stale: true`) or direct search links (`fallback: true`). Requires `ddgs>=9.16.1` ([ddgs#427](https://github.com/deedy5/ddgs/issues/427)).
 
 ### 🕷️ Scrape a Page (`scrapepage.bat`)
 

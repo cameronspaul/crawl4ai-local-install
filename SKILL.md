@@ -8,7 +8,7 @@ description: Use when the user wants to research a topic, find up-to-date inform
 Find **current, real-world information** by searching the web, then **reading the actual pages**. Scan multiple sites, pick the best sources, and pull concrete details.
 
 It uses the CLI tools in this repo:
-- `websearch.bat` — live web search (DuckDuckGo). Returns titles, URLs, sites, dates, and snippets.
+- `websearch.bat` — live web search (DDGS). Returns titles, URLs, sites, dates, and snippets.
 - `scrapepage.bat` — reads a full page and converts it to clean Markdown, or returns raw HTML with `--html`.
 
 ## Workflow
@@ -23,18 +23,21 @@ Run one or more searches with `websearch.bat`. Search more than once with differ
 .\websearch.bat "your topic query"
 ```
 
+`websearch.bat` always returns at least one result. `stale: true` means last successful results; `fallback: true` means direct search links — treat those as navigation, not evidence.
+
 Useful options:
 - `-n <N>` — number of results (default 10).
 - `--news` — news results with published dates (great for "what's the latest").
-- `-t w` — time filter: `d` (day), `w` (week), `m` (month), `y` (year). Use for up-to-date data.
+- `-t w` — time filter (`d/w/m/y`); a hint, not a hard filter.
+- `--recent` — prefer the last week and sort by date, newest first. Best with `--news`.
 - `--markdown` — markdown-formatted list; `--json` for structured JSON.
 - `-r <region>` — region, e.g. `us-en`, `uk-en`.
 - `--no-cache` / `--fresh` — bypass the local search cache.
 
-For "latest/current" questions, combine `--news` with a time filter:
+For "latest/current" questions, use `--news --recent`:
 
 ```powershell
-.\websearch.bat "latest <topic> 2026" --news -n 10 -t w
+.\websearch.bat "latest <topic>" --news -n 10 --recent
 ```
 
 ### 2. Pick the best sources
@@ -73,7 +76,7 @@ Combine what you found across sources into a clear, sourced answer. Note where s
 
 - **Always verify with real data.** Don't guess or rely on memory for current facts, prices, versions, or events — search and scrape instead.
 - **Prefer multiple sources** for any factual claim. Cross-check by reading at least 2-3 pages for important facts.
-- **Use time filters for anything time-sensitive** ("latest", "now", "this week", prices, versions).
+- **Use `--news --recent` for anything time-sensitive** ("latest", "now", "this week", prices, versions).
 - **If a page fails to scrape** (`scrapepage.bat` prints an error), treat it as unavailable and move on to another source. The scraper already escalates from the fast HTTP tier to the anti-bot stealth browser automatically, so a failure means the site is genuinely inaccessible (or needs interactive human verification). Do NOT try alternative curl/Python workarounds.
 - **Keep the final answer concise and organized, with the source URL next to each key claim.**
 
