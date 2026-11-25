@@ -251,14 +251,77 @@ def detect_site_hint(query):
 
 
 def query_tokens(query):
+    """Content tokens only: site words (`reddit`, `github`, ...) are handled
+    separately as a site hint and must not let any page on that site win."""
+    cleaned = re.sub(r"\bsite:\S+", " ", query.lower())
     return {
-        token for token in re.findall(r"\w+", query.lower())
-        if len(token) > 1 and token not in QUERY_STOPWORDS and not token.startswith("site:")
+        token for token in re.findall(r"\w+", cleaned)
+        if len(token) > 1 and token not in QUERY_STOPWORDS
+        and token not in SITE_HINTS and token != "site"
     }
 
 
-def relevance_score(row, query, site_hint=None, recency=False):
-    """Score a result against the query that produced it and any site hint."""
+def build_query_variants(query, corrected=None, site_hint=None):
+    """Google-style query facets: typo fix, site-scoped search and a quoted
+    distinctive-phrase search. They race in parallel and their results are
+    merged, so one query can answer several intents at once."""
+    base = corrected or query
+    variants = []
+    if corrected and corrected.lower() != query.lower():
+        variants.append(corrected)
+    if site_hint and not re.search(r"\bsite:", base, re.IGNORECASE):
+        site_base = " ".join(
+            token for token in re.findall(r"\w+", base)
+            if token.lower() not in SITE_HINTS
+        ) or base
+        variants.append(f"{site_base} site:{site_hint}")
+    tokens = [
+        token for token in re.findall(r"\w+", base.lower())
+        if len(token) > 1 and token not in QUERY_STOPWORDS and token not in SITE_HINTS
+    ]
+    if len(tokens) >= 3:
+        phrase = " ".join(tokens[-3:])
+        remainder = " ".join(tokens[:-3])
+        variant = f'"{phrase}" {remainder}'.strip()
+        if variant.lower() != base.lower():
+            variants.append(variant)
+
+    seen = {query.lower()}
+    unique = []
+    for variant in variants:
+        if variant.lower() not in seen:
+            seen.add(variant.lower())
+            unique.append(variant)
+    return unique[:3]
+
+
+def _domain_key(url: str) -> str:
+    """Group www.reddit.com and old.reddit.com into one domain for diversity."""
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        return ""
+    parts = [part for part in host.split(".") if part]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def _token_weights(rows, query):
+    """Rarer query terms are more informative: 'unofficial' should count far
+    more than 'gta', which appears in nearly every result."""
+    tokens = query_tokens(query)
+    total = max(1, len(rows))
+    counts = {token: 0 for token in tokens}
+    for row in rows:
+        text = " ".join(str(row.get(key) or "") for key in ("title", "body", "snippet", "href", "url")).lower()
+        for token in tokens:
+            if token in text:
+                counts[token] += 1
+    return {token: 1.0 + 2.0 * (1.0 - counts[token] / total) for token in tokens}
+
+
+def relevance_score(row, query, site_hint=None, recency=False, weights=None):
+    """Score a result against the query that produced it, weighting specific
+    terms, coverage and freshness instead of raw keyword presence alone."""
     source_query = row.get("_query") or query
     tokens = query_tokens(source_query)
     title = str(row.get("title") or "").lower()
@@ -270,44 +333,61 @@ def relevance_score(row, query, site_hint=None, recency=False):
         token for token in re.findall(r"\w+", source_query.lower()) if token in tokens
     )
     if phrase and phrase in re.sub(r"\W+", " ", title + " " + snippet):
-        score += 8
+        score += 6
     for token in tokens:
+        weight = weights.get(token, 1.0) if weights else 1.0
         if token in title:
-            score += 3
+            score += 3 * weight
         if token in snippet:
-            score += 1
+            score += weight
         if token in url:
-            score += 1
+            score += 0.5 * weight
     if tokens:
         coverage = sum(1 for t in tokens if t in title or t in snippet) / len(tokens)
-        score += coverage * 6
+        score += coverage * 8
+        if coverage < 0.5:
+            score -= (0.5 - coverage) * 10
+    if weights and tokens:
+        rarest = max(tokens, key=lambda t: weights.get(t, 1.0))
+        if rarest not in title and rarest not in snippet and rarest not in url:
+            score -= 3
     if site_hint:
         domain = urlparse(url).netloc.lower() if url else ""
         if site_hint in domain:
-            score += 14
+            score += 3  # a tiebreaker, not a blanket pass like the old +14
         elif site_hint in title or site_hint in snippet:
-            score += 2
+            score += 1
     timestamp = date_to_timestamp(row.get("date") or "")
     if timestamp is not None:
-        score += 2
-        if recency:
-            score += max(0.0, 6 - (time.time() - timestamp) / 604800)
+        age_days = max(0.0, (time.time() - timestamp) / 86400)
+        # Freshness breaks ties between equally relevant results; it must not
+        # outrank a result that actually matches the distinctive query terms.
+        score += max(0.0, 6 - age_days / 30) * (2.0 if recency else 0.35)
     return score
 
 
-def rank_and_dedupe(rows, query, site_hint=None, recency=False):
-    """Sort merged results by relevance, dropping duplicate URLs."""
+def rank_and_dedupe(rows, query, site_hint=None, recency=False, per_domain_cap=3):
+    """Sort merged results by relevance, dropping duplicate URLs and capping
+    how many results one domain may occupy."""
+    weights = _token_weights(rows, query)
     scored = [
-        (relevance_score(row, query, site_hint, recency), index, row)
+        (relevance_score(row, query, site_hint, recency, weights), index, row)
         for index, row in enumerate(rows)
     ]
     scored.sort(key=lambda item: (-item[0], item[1]))
     seen = set()
+    domains = {}
     ranked = []
     for _, _, row in scored:
         key = row.get("href") or row.get("url") or row.get("title", "")
         if key in seen:
             continue
+        domain = _domain_key(key)
+        if domain:
+            cap = 4 if site_hint and site_hint in domain else per_domain_cap
+            if domains.get(domain, 0) >= cap:
+                continue
+            domains[domain] = domains.get(domain, 0) + 1
         seen.add(key)
         ranked.append(row)
     return ranked
@@ -466,8 +546,11 @@ def _live_search(query, max_results, search_type, region, timelimit, backend, re
             secondary.insert(0, f"direct:{DIRECT_TEXT_ENGINES[0]}")
         secondary.append("auto")
 
-    extra = corrected_queries(query) if category == "text" else []
     site_hint = detect_site_hint(query)
+    extra = []
+    if category == "text":
+        fixes = corrected_queries(query)
+        extra = build_query_variants(query, fixes[0] if fixes else None, site_hint)
     rows = _race_backends(
         query, category, primary, kwargs, SEARCH_TIMEOUT, FIRST_WAVE_WAIT, max_results,
         extra_queries=extra,
@@ -546,7 +629,7 @@ def search(
     def finish(results):
         return sort_by_date(results) if recent else results
 
-    cache_key = make_search_key(query, search_type, max_results, region, backend)
+    cache_key = make_search_key(query, search_type, max_results, region, backend, timelimit, recent)
     if not no_cache:
         cached = get_cached_search(cache_key)
         if cached:

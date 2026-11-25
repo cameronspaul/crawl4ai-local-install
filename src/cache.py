@@ -10,9 +10,19 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.path.join(PROJECT_DIR, ".cache")
 DB_PATH = os.path.join(CACHE_DIR, "fast_cache.db")
 
+try:
+    from stealth import is_usable_content
+except ImportError:
+    try:
+        from src.stealth import is_usable_content
+    except ImportError:
+        def is_usable_content(text, min_words=20):
+            return bool(text) and len(text.strip()) >= 40
+
 #: Bump whenever the shape of cached Markdown changes so old-format entries
-#: are never served to a client expecting the new layout.
-MARKDOWN_CACHE_VERSION = 2
+#: are never served to a client expecting the new layout. Bumped to 3 to
+#: invalidate challenge/thin pages cached by earlier versions.
+MARKDOWN_CACHE_VERSION = 3
 
 
 def make_markdown_cache_key(url: str) -> str:
@@ -75,8 +85,14 @@ def get_cached_scrape(url: str, ttl: float = 7200) -> Optional[str]:
 
 
 def set_cached_scrape(url: str, content: str) -> None:
-    """Store scraped markdown in local cache."""
+    """Store scraped markdown in local cache.
+
+    Wall and empty-shell results are refused so a transient bot challenge can
+    never poison the cache for the next two hours.
+    """
     if not content or len(content.strip()) < 40:
+        return
+    if not is_usable_content(content, min_words=5 if url.startswith("html:") else 20):
         return
     try:
         url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
@@ -106,8 +122,10 @@ def set_cached_html(url: str, content: str) -> None:
     set_cached_scrape("html:" + url, content)
 
 
-def make_search_key(query: str, search_type: str, max_results: int, region: str = None, backend: str = "fast") -> str:
-    raw = f"{query.strip().lower()}|{search_type}|{max_results}|{region or ''}|{backend}"
+def make_search_key(query: str, search_type: str, max_results: int, region: str = None, backend: str = "fast", timelimit: str = None, recent: bool = False) -> str:
+    # Time-filtered and recency-ranked searches must never reuse an unfiltered
+    # cache entry (or vice versa) — otherwise -t w / --recent silently change.
+    raw = f"{query.strip().lower()}|{search_type}|{max_results}|{region or ''}|{backend}|{timelimit or ''}|{bool(recent)}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

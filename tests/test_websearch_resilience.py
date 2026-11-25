@@ -133,6 +133,49 @@ class QueryUnderstandingTests(unittest.TestCase):
         self.assertEqual(len(ranked), 2)
         self.assertIn("reddit.com", ranked[0]["href"])
 
+    def test_site_word_is_not_a_content_token(self):
+        self.assertEqual(websearch.query_tokens("gta 6 pc port reddit site:github.com"), {"gta", "pc", "port"})
+
+    def test_query_variants_include_typo_site_and_phrase_facets(self):
+        variants = websearch.build_query_variants(
+            "gta 6 unoffical pc port reddit", "gta 6 unofficial pc port reddit", "reddit.com"
+        )
+        self.assertEqual(len(variants), 3)
+        self.assertIn("gta 6 unofficial pc port reddit", variants)
+        self.assertTrue(any("site:reddit.com" in v and "reddit" not in v.split("site:")[0] for v in variants))
+        self.assertTrue(any(v.startswith('"unofficial pc port"') for v in variants))
+
+    def test_fresh_specific_result_beats_old_generic_thread_on_hinted_site(self):
+        query = "gta 6 unofficial pc port reddit"
+        old_thread = {
+            "title": "GTA 6 on PC?!?!",
+            "body": "Rockstar only mentioned PS5 and Xbox series x/s No PC! Waiting for a PC port.",
+            "href": "https://www.reddit.com/r/GTA6/comments/18bjlvh/",
+        }
+        fresh_article = {
+            "title": "Unofficial GTA 6 PC port makes rapid progress",
+            "body": "The race for an unofficial GTA 6 PC port just heated up.",
+            "href": "https://www.techradar.com/gaming/unofficial-gta-6-pc-port",
+            "date": "1 day ago",
+        }
+        ranked = websearch.rank_and_dedupe(
+            [old_thread, fresh_article], query, site_hint="reddit.com"
+        )
+        self.assertIn("techradar.com", ranked[0]["href"])
+
+    def test_domain_diversity_cap_keeps_other_sites(self):
+        rows = [
+            {"title": "unofficial pc port guide", "href": f"https://a.example/{i}", "body": "unofficial pc port"}
+            for i in range(4)
+        ]
+        rows.append({
+            "title": "unofficial pc port news", "href": "https://b.example/1",
+            "body": "unofficial pc port",
+        })
+        ranked = websearch.rank_and_dedupe(rows, "unofficial pc port")
+        self.assertEqual(len(ranked), 4)
+        self.assertEqual(sum("a.example" in r["href"] for r in ranked), 3)
+
 
 class RecentDateTests(unittest.TestCase):
     def test_date_to_timestamp_handles_relative_and_absolute_dates(self):
