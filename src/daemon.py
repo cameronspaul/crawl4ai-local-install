@@ -104,7 +104,7 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
             # Raw HTML is cached under its own key (never mixed with Markdown).
             if raw and not no_cache:
                 cached_html = cache.get_cached_html(url)
-                if cached_html:
+                if cached_html and scrapepage.is_usable_content(cached_html, min_words=5):
                     self._send_json({"success": True, "cached": True, "content": cached_html})
                     return
 
@@ -113,7 +113,7 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
             cache_key = cache.make_markdown_cache_key(url)
             if readable and not raw and not no_cache and not force_stealth:
                 cached = cache.get_cached_scrape(cache_key)
-                if cached:
+                if cached and scrapepage.is_usable_content(cached):
                     self._send_json({"success": True, "cached": True, "content": cached})
                     return
 
@@ -122,15 +122,21 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
                 try:
                     resp = _primp_pool.get(url)
                     if resp.status_code == 200 and resp.text and len(resp.text.strip()) >= 80:
-                        is_challenge = any(pat.search(resp.text[:3000]) for pat in scrapepage.CHALLENGE_PATTERNS)
-                        if not is_challenge and not scrapepage.looks_like_consent(resp.text):
+                        if (
+                            scrapepage.is_usable_content(
+                                resp.text, min_words=scrapepage.FAST_HTML_MIN_WORDS, aggressive=True
+                            )
+                            and not scrapepage.looks_like_consent(resp.text)
+                        ):
                             if raw:
                                 if markers_present(resp.text):
                                     cache.set_cached_html(url, resp.text)
                                 self._send_json({"success": True, "cached": False, "source": "primp_pool", "content": resp.text})
                                 return
                             md = scrapepage.fast_html_to_markdown(resp.text, url, readable=readable)
-                            if len(md.strip()) >= 40:
+                            if len(md.strip()) >= 40 and scrapepage.is_usable_content(
+                                md, min_words=scrapepage.FAST_MD_MIN_WORDS, aggressive=True
+                            ):
                                 if readable:
                                     cache.set_cached_scrape(cache_key, md)
                                 self._send_json({"success": True, "cached": False, "source": "primp_pool", "content": md})
@@ -149,7 +155,7 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
                         settle_wait=settle_wait,
                         verbose=verbose,
                     )
-                    if html and len(html.strip()) >= 200:
+                    if html and len(html.strip()) >= 200 and scrapepage.is_usable_content(html, min_words=5):
                         if markers_present(html):
                             cache.set_cached_html(url, html)
                         self._send_json({"success": True, "cached": False, "source": "stealth_raw", "content": html})

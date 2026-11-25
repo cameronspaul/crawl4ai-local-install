@@ -62,7 +62,12 @@ except ImportError:
 if stealth_tier is not None:
     looks_like_challenge = stealth_tier.looks_like_challenge
     looks_like_consent = stealth_tier.looks_like_consent
+    is_usable_content = stealth_tier.is_usable_content
+    FAST_HTML_MIN_WORDS = stealth_tier._MIN_HTML_WORDS_FAST
+    FAST_MD_MIN_WORDS = stealth_tier._MIN_BODY_WORDS_FAST
 else:
+    FAST_HTML_MIN_WORDS = 10
+    FAST_MD_MIN_WORDS = 40
     def looks_like_challenge(text: str) -> bool:
         if not text or len(text) > 9000:
             return False
@@ -70,6 +75,12 @@ else:
 
     def looks_like_consent(text: str) -> bool:
         return False
+
+    def is_usable_content(text: str, min_words: int = 20, aggressive: bool = False) -> bool:
+        """Minimal stand-in used only when the stealth module cannot be imported."""
+        if not text:
+            return False
+        return len(re.findall(r"\w+", text)) >= min_words and not looks_like_challenge(text)
 
 
 #: Optional override installed by the daemon so the stealth tier reuses a warm
@@ -399,9 +410,10 @@ def try_fast_html(url: str, timeout: int = 10, min_chars: int = 200) -> tuple[bo
         if not text or len(text.strip()) < min_chars:
             return False, "Response body too short"
 
-        for pat in CHALLENGE_PATTERNS:
-            if pat.search(text[:3000]):
-                return False, "Bot challenge detected"
+        # One shared gate for all callers: anti-bot walls and near-empty shells
+        # must never satisfy the fast tier, or we never escalate to stealth.
+        if not is_usable_content(text, min_words=FAST_HTML_MIN_WORDS, aggressive=True):
+            return False, "Bot challenge or thin shell"
 
         if looks_like_consent(text):
             return False, "Consent wall"
@@ -419,8 +431,8 @@ def try_fast_scrape(url: str, timeout: int = 10, readable: bool = True) -> tuple
 
     try:
         md = fast_html_to_markdown(text, url, readable=readable)
-        if len(md.strip()) < 40:
-            return False, "Insufficient markdown extracted"
+        if len(md.strip()) < 40 or not is_usable_content(md, min_words=FAST_MD_MIN_WORDS, aggressive=True):
+            return False, "Insufficient or thin markdown extracted"
 
         return True, md
     except Exception as e:
@@ -466,7 +478,11 @@ def scrape_html(
         )
         # Older daemons ignore the raw flag and return Markdown; only accept a
         # response that actually looks like HTML.
-        if daemon_res and daemon_res.lstrip()[:1] == "<":
+        if (
+            daemon_res
+            and daemon_res.lstrip()[:1] == "<"
+            and is_usable_content(daemon_res, min_words=5)
+        ):
             if verbose:
                 print(f"[scrapepage] Micro-daemon served raw HTML for '{url}'", file=sys.stderr)
             return daemon_res
@@ -511,11 +527,12 @@ def scrape_html(
             ready_markers=ready_markers,
         )
 
-    if content and len(content.strip()) >= 200:
+    if content and len(content.strip()) >= 200 and is_usable_content(content, min_words=5):
         return content
 
     raise RuntimeError(
-        f"Error: Could not fetch HTML from '{url}'. The page may need interactive verification."
+        f"Error: Could not fetch real HTML from '{url}'. The page may be behind "
+        "an interactive verification wall."
     )
 
 
@@ -540,20 +557,24 @@ def scrape_single(
     # cached, so an opt-out request cannot be served a formatted entry.
     if readable and not no_cache and not force_stealth:
         cached = get_cached_scrape(cache_key)
-        if cached:
+        if cached and is_usable_content(cached):
             if verbose:
                 print(f"[scrapepage] Cache hit for '{url}'", file=sys.stderr)
             return cached
+        if cached and verbose:
+            print(f"[scrapepage] Ignoring thin/challenge cache entry for '{url}'", file=sys.stderr)
 
     # Tier 0.5: Persistent Micro-Daemon (warm connection pool & warm stealth browser)
     if not os.environ.get("INSIDE_DAEMON") and is_daemon_alive():
         daemon_res = daemon_scrape(
             url, timeout=timeout, no_cache=no_cache, force_stealth=force_stealth, readable=readable
         )
-        if daemon_res:
+        if daemon_res and is_usable_content(daemon_res):
             if verbose:
                 print(f"[scrapepage] Micro-daemon served '{url}'", file=sys.stderr)
             return daemon_res
+        if daemon_res and verbose:
+            print(f"[scrapepage] Ignoring thin/challenge daemon result for '{url}'", file=sys.stderr)
 
     # Tier 1: Fast HTTP Path (Rust primp: browser TLS impersonation, no JS)
     if not force_stealth:
@@ -581,7 +602,7 @@ def scrape_single(
         if verbose:
             print(f"[scrapepage] Stealth tier failed for '{url}': {error}", file=sys.stderr)
 
-    if content and len(content.strip()) >= MIN_CONTENT:
+    if content and len(content.strip()) >= MIN_CONTENT and is_usable_content(content):
         if readable:
             set_cached_scrape(cache_key, content)
         return content
@@ -592,7 +613,10 @@ def scrape_single(
             f"Run '.\\scripts\\install.ps1' (or 'invisible-playwright fetch'). '{url}'"
         )
     detail = f": {error}" if error else ""
-    raise RuntimeError(f"Error: Page doesn't seem to exist. Failed to scrape. Don't attempt again. '{url}'{detail}")
+    raise RuntimeError(
+        f"Error: No readable content from '{url}' (bot wall or empty page). "
+        f"Don't attempt again.{detail}"
+    )
 
 
 def main():

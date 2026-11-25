@@ -54,20 +54,123 @@ CHALLENGE_PATTERNS = [
     re.compile(r"just a moment while we (check|verify)", re.I),
     re.compile(r"press\s*&?\s*hold to confirm", re.I),
     re.compile(r"keep holding", re.I),
+    # Reddit-style interstitials. These are kept specific so an article that
+    # merely discusses captchas or moderation is not mistaken for a wall.
+    re.compile(r"prove your humanity", re.I),
+    re.compile(r"let us know you'?re a real person", re.I),
+    re.compile(r"complete the challenge below", re.I),
+    re.compile(r"blocked by network security", re.I),
+    re.compile(r"you'?ve been blocked", re.I),
+    re.compile(r"your request has been blocked", re.I),
+    re.compile(r"log in to use old reddit", re.I),
+    # Cloudflare Turnstile / "Managed Challenge" screens (cars.com, redfin.com, ...)
+    re.compile(r"just a moment\.{3}", re.I),
+    re.compile(r"performing security verification", re.I),
+    re.compile(r"security service to protect against malicious bots", re.I),
+    re.compile(r"let'?s confirm you are human", re.I),
+    re.compile(r"complete the security check before continuing", re.I),
+    re.compile(r"verif(?:y|ying|ication) (?:that )?you are (?:not )?(?:a )?human", re.I),
+]
+
+#: Extra, deliberately broad phrases used only by the *fast* tier. A hit here
+#: just triggers a stealth render (cheap when the daemon is warm), so we can
+#: afford false positives that would be unacceptable for the final result.
+AGGRESSIVE_CHALLENGE_PATTERNS = [
+    re.compile(r"\bcaptcha\b", re.I),
+    re.compile(r"\b(?:anti[- ]?bot|bot (?:check|detection|protection))\b", re.I),
+    re.compile(r"human verification", re.I),
+    re.compile(r"verify (?:that )?you(?:'?re| are) (?:a )?human", re.I),
+    re.compile(r"security check", re.I),
+    re.compile(r"access denied|403 forbidden|\bforbidden\b", re.I),
+    re.compile(r"(?:too many requests|rate limit(?:ed)?|temporarily (?:blocked|unavailable))", re.I),
+    re.compile(r"please enable (?:javascript|cookies)", re.I),
+    re.compile(r"javascript is (?:disabled|required)", re.I),
+    re.compile(r"unusual traffic", re.I),
+    re.compile(r"(?:sign|log) in to continue", re.I),
+    re.compile(r"(?:service unavailable|request (?:could not|cannot|can't) be completed)", re.I),
 ]
 
 #: A challenge interstitial is small. Anything past this is treated as real
 #: content even if it happens to contain one of the phrases above.
 _MAX_CHALLENGE_CHARS = 9000
 
+#: The fast tier is more suspicious: it checks the broader pattern list over a
+#: longer window before deciding to pay for a browser render.
+_MAX_CHALLENGE_CHARS_FAST = 25000
 
-def looks_like_challenge(text: Optional[str]) -> bool:
+#: Minimum real prose we expect from a rendered page. The fast tier used to
+#: accept any result over 40 characters, which let short interstitial shells
+#: (a heading plus a handful of footer links) masquerade as scraped content.
+_MIN_BODY_WORDS = 20
+
+#: The eager thresholds for the fast tier. Extra stealth renders are fine;
+#: returning a login/captcha shell is not.
+_MIN_BODY_WORDS_FAST = 40
+_MIN_HTML_WORDS_FAST = 10
+
+#: The readable formatter moves these blocks into numbered appendices. They
+#: must not count as page content when judging whether a result is thin.
+_READABLE_APPENDICES = ("## Header & footer links", "## Images")
+
+
+def _visible_text(text: str) -> str:
+    """Strip markup/link-only appendices so word counts reflect real prose."""
+    if not text:
+        return ""
+    stripped = text.lstrip()
+    if stripped.startswith("<") and (
+        "<html" in text[:500].lower() or "<!doctype" in text[:500].lower()
+        or "<body" in text[:500].lower() or "<div" in text[:500].lower()
+    ):
+        cleaned = re.sub(r"(?is)<(script|style|noscript|a)\b[^>]*>.*?</\1\s*>", " ", text)
+        return re.sub(r"(?s)<[^>]+>", " ", cleaned)
+    lines = []
+    for line in text.splitlines():
+        if line.strip() in _READABLE_APPENDICES:
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def looks_thin(text: Optional[str], min_words: int = _MIN_BODY_WORDS) -> bool:
+    """True when `text` is an empty shell or has almost no real prose."""
+    if not text:
+        return True
+    return len(re.findall(r"\w+", _visible_text(text))) < min_words
+
+
+def is_usable_content(
+    text: Optional[str], min_words: int = _MIN_BODY_WORDS, aggressive: bool = False
+) -> bool:
+    """True when `text` is neither an anti-bot wall nor a thin empty shell.
+
+    ``aggressive=True`` is for the fast tier only: broader wall phrases, a
+    longer scan window and a higher prose bar, so questionable pages get a
+    stealth render. The final browser result is checked leniently, so short
+    but legitimate pages still come through.
+    """
+    if not text:
+        return False
+    # Run the wall patterns on visible text, not raw HTML: a bot wall often
+    # carries thousands of characters of inline scripts that would otherwise
+    # push it past the anti-false-positive length guard.
+    visible = _visible_text(text)
+    if looks_like_challenge(visible, aggressive=aggressive):
+        return False
+    return not looks_thin(text, min_words=min_words)
+
+
+def looks_like_challenge(text: Optional[str], aggressive: bool = False) -> bool:
     """True when `text` reads like an anti-bot wall rather than a real page."""
     if not text:
         return False
-    if len(text) > _MAX_CHALLENGE_CHARS:
+    limit = _MAX_CHALLENGE_CHARS_FAST if aggressive else _MAX_CHALLENGE_CHARS
+    if len(text) > limit:
         return False
-    return any(pat.search(text) for pat in CHALLENGE_PATTERNS)
+    patterns = CHALLENGE_PATTERNS
+    if aggressive:
+        patterns = CHALLENGE_PATTERNS + AGGRESSIVE_CHALLENGE_PATTERNS
+    return any(pat.search(text) for pat in patterns)
 
 
 #: Client-side apps that have finished their network but not their paint show

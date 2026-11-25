@@ -23,6 +23,9 @@ Run one or more searches with `websearch.bat`. Search more than once with differ
 .\websearch.bat "your topic query"
 ```
 
+`websearch.bat` always returns at least one result. `stale: true` means last successful results; `fallback: true` means direct search links — treat those as navigation, not evidence. Typos are auto-corrected, then the query is expanded into parallel facets (a `site:`-scoped variant and a quoted key-phrase variant); results are reranked by specific-term match, coverage and freshness, with a cap per domain. Site words (e.g. `reddit`) are only a tiebreaker, so fresh specific pages rank above old generic threads.
+
+
 Useful options:
 - `-n <N>` — number of results (default 10).
 - `--news` — news results with published dates (great for "what's the latest").
@@ -65,6 +68,12 @@ Use `--html` when you need the page's structure rather than prose (JSON-LD, tabl
 
 Use `--no-cache` when the answer depends on a value that changes (prices, stock, live scores).
 
+#### Getting through a blocked page
+
+Try in order: `-v` (see the tier and why fast was bypassed) → `--no-cache` (stale/cached wall) → `--stealth` (force browser) → `--html` or `scrape_html(..., ready_markers=...)` (app shell). The fast check is deliberately eager; the final browser result is lenient, so short legit pages still return. Keep the daemon warm (`.\daemon.bat start`; `restart` after code changes) so stealth takes ~1–4 s instead of ~10 s. Sites like Reddit/Tesla auto-escalate and succeed; Cars.com/G2 escalate but end at a challenge — then move on, with no curl/Python workarounds.
+
+URLs with `&`: call the script directly with the URL quoted, e.g. `.\.venv\Scripts\python.exe -X utf8 src/scrapepage.py "https://example.com/?a=1&b=2"`.
+
 ### 4. Synthesize
 
 Combine what you found across sources into a clear, sourced answer. Note where sources agree or conflict. Reference which site/URL each claim came from.
@@ -73,8 +82,8 @@ Combine what you found across sources into a clear, sourced answer. Note where s
 
 - **Always verify with real data.** Don't guess or rely on memory for current facts, prices, versions, or events — search and scrape instead.
 - **Prefer multiple sources** for any factual claim. Cross-check by reading at least 2-3 pages for important facts.
-- **Use time filters for anything time-sensitive** ("latest", "now", "this week", prices, versions).
-- **If a page fails to scrape** (`scrapepage.bat` prints an error), treat it as unavailable and move on to another source. The scraper already escalates from the fast HTTP tier to the anti-bot stealth browser automatically, so a failure means the site is genuinely inaccessible (or needs interactive human verification). Do NOT try alternative curl/Python workarounds.
+- **Use `--news --recent` for anything time-sensitive** ("latest", "now", "this week", prices, versions).
+- **If a page fails to scrape**, try `-v`, `--no-cache`, `--stealth`, `--html` and the warm daemon (above). If it still fails, move to another source. Do NOT try curl/Python workarounds.
 - **Keep the final answer concise and organized, with the source URL next to each key claim.**
 
 ## Example

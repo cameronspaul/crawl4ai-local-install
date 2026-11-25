@@ -26,7 +26,13 @@ IMPORTANT NOTE - If a page still can't be scraped, don't try anything else (no a
 .\websearch.bat "latest travel rule" --news -t w
 ```
 
-Search options: `-n <N>` (default 10), `--news`, `-t d|w|m|y`, `--markdown` / `--json`, `-r <region>` (e.g. `uk-en`), `--no-cache` / `--fresh`.
+Search options: `-n <N>` (default 10), `--news`, `-t d|w|m|y`, `--recent`, `--markdown` / `--json`, `-r <region>` (e.g. `uk-en`), `--no-cache` / `--fresh`.
+
+`--recent` asks for the last week (unless `-t` is given) and sorts by date, newest first. `-t` is only a hint to engines; use `--news` when recency matters, since news results carry real dates.
+
+Search always returns something: engines are raced in parallel (~1 s), Bing first, Yahoo/`auto` as fallbacks. If all fail, it serves last successful results (`stale: true`) or direct search links (`fallback: true`). Requires `ddgs>=9.16.1` ([ddgs#427](https://github.com/deedy5/ddgs/issues/427)).
+
+Queries are spell-corrected via autocomplete, then expanded into parallel facets (site-scoped search like `site:reddit.com`, and a quoted distinctive-phrase search) so one query covers several intents. Merged results are reranked by specific-term match, coverage and freshness (not just keyword presence), with a cap of ~3 results per domain so no single site crowds out the rest. Site words like `reddit` are a mild tiebreaker, not a blanket boost — old generic threads no longer outrank fresh, on-topic results.
 
 ### 🕷️ Scrape a Page (`scrapepage.bat`)
 
@@ -59,7 +65,15 @@ Each URL stops at the first tier that returns real content:
 3. **Fast HTTP** (`primp`) — impersonated browser TLS, no JS. Handles most sites in well under a second.
 4. **Stealth Firefox** (`invisible_playwright`) — the anti-bot engine and the only browser tier. A patched Firefox whose fingerprint is produced inside the engine and whose pointer motion is humanized; it renders JS and gets past Cloudflare / DataDome / PerimeterX walls.
 
-If the fast tier can't get real content (no JS, a bot wall, an empty shell, or an anti-bot `202`) the request escalates to the stealth browser automatically. A page that still fails is genuinely unavailable — or waiting on interactive human verification, such as a press-and-hold captcha.
+If the fast tier gets a bot wall or a near-empty shell, the shared gate in `src/stealth.py` (`is_usable_content`) rejects it and escalates to stealth. The fast check is deliberately eager (broader phrases, ≥40 body words); the final browser result is checked leniently (≥20 words), so short legitimate pages still return after escalating. Walls are never cached.
+
+### Getting through a hard site
+
+Try in order: `-v` (see why fast was bypassed) → `--no-cache` (stale/cached wall) → `--stealth` (force browser) → `--html` or `scrape_html(..., ready_markers=...)` (app shell). Keep the daemon warm (`.\daemon.bat start`; `restart` after code changes) so stealth takes ~1–4 s instead of ~10 s. If stealth still returns a challenge, use another source — no curl/Python workarounds.
+
+Auto-escalation was confirmed on Reddit, Tesla, Zoopla and Apartments.com; Cars.com, Redfin, G2 and Trulia escalate too but end at a challenge.
+
+To watch the full ladder, bypass the daemon: `$env:INSIDE_DAEMON = '1'`, then run `src/scrapepage.py ... -v --no-cache`. URLs with `&` need that direct Python call too (with the URL quoted).
 
 ### Keeping it fast
 
